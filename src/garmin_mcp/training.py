@@ -502,15 +502,18 @@ def register_tools(app):
                 device_data = data
                 break
 
-            acwr_data = device_data.get("acuteTrainingLoadDTO", {})
+            acwr_data = device_data.get("acuteTrainingLoadDTO") or {}
 
-            # VO2 Max data
-            vo2_data = status.get("mostRecentVO2Max", {}).get("generic", {})
-            cycling_vo2_data = status.get("mostRecentVO2Max", {}).get("cycling", {})
+            # VO2 Max data. Garmin returns explicit JSON nulls for missing
+            # sections (e.g. "cycling": null for runners), and dict.get()
+            # returns that None instead of the {} default — guard with `or {}`.
+            vo2_root = status.get("mostRecentVO2Max") or {}
+            vo2_data = vo2_root.get("generic") or {}
+            cycling_vo2_data = vo2_root.get("cycling") or {}
 
             # Training load balance
-            load_balance = status.get("mostRecentTrainingLoadBalance", {})
-            load_map = load_balance.get("metricsTrainingLoadBalanceDTOMap", {})
+            load_balance = status.get("mostRecentTrainingLoadBalance") or {}
+            load_map = load_balance.get("metricsTrainingLoadBalanceDTOMap") or {}
             load_data = {}
             for device_id, data in load_map.items():
                 load_data = data
@@ -734,12 +737,16 @@ def register_tools(app):
             try:
                 data = garmin_client.get_training_status(date_str)
                 if data:
-                    status_data = (
-                        data.get("mostRecentTrainingStatus", {})
-                        .get("latestTrainingStatusData", {})
+                    # latestTrainingStatusData is keyed by device id — unwrap
+                    # the first device entry (same as get_training_status).
+                    latest_map = (
+                        (data.get("mostRecentTrainingStatus") or {})
+                        .get("latestTrainingStatusData")
+                        or {}
                     )
-                    atl_dto = status_data.get("acuteTrainingLoadDTO", {})
-                    vo2_data = data.get("mostRecentVO2Max", {}).get("generic", {})
+                    status_data = next(iter(latest_map.values()), {})
+                    atl_dto = status_data.get("acuteTrainingLoadDTO") or {}
+                    vo2_data = (data.get("mostRecentVO2Max") or {}).get("generic") or {}
                     entry: Dict[str, Any] = {"date": date_str}
                     atl = atl_dto.get("dailyTrainingLoadAcute")
                     ctl = atl_dto.get("dailyTrainingLoadChronic")
@@ -755,8 +762,15 @@ def register_tools(app):
                     acwr_status = atl_dto.get("acwrStatus")
                     if acwr_status:
                         entry["acwr_status"] = acwr_status
-                    ts = status_data.get("trainingStatusDTO", {})
-                    ts_label = ts.get("trainingStatusCyclingFeedbackPhrase") or ts.get("trainingStatusFeedbackPhrase")
+                    # the feedback phrase lives directly on the device entry;
+                    # keep the legacy trainingStatusDTO lookup as a fallback
+                    ts = status_data.get("trainingStatusDTO") or {}
+                    ts_label = (
+                        status_data.get("trainingStatusCyclingFeedbackPhrase")
+                        or status_data.get("trainingStatusFeedbackPhrase")
+                        or ts.get("trainingStatusCyclingFeedbackPhrase")
+                        or ts.get("trainingStatusFeedbackPhrase")
+                    )
                     if ts_label:
                         entry["training_status"] = ts_label
                     vo2 = vo2_data.get("vo2MaxValue")
