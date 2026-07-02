@@ -347,6 +347,22 @@ def register_tools(app):
                     entry["current_feedback"] = feedback.get('feedbackShortType')
                     entry["body_battery_level"] = feedback.get('bodyBatteryLevel')
 
+                # Precise 0-100 level from the last measured row of the values
+                # array (the feedback event only carries a coarse label).
+                rows = day.get('bodyBatteryValuesArray')
+                if isinstance(rows, list):
+                    index = 2
+                    for descriptor in day.get('bodyBatteryValueDescriptorDTOList') or []:
+                        if isinstance(descriptor, dict) and 'bodyBatteryLevel' in descriptor.values():
+                            ints = [v for v in descriptor.values() if isinstance(v, int) and not isinstance(v, bool)]
+                            if ints:
+                                index = ints[0]
+                            break
+                    for row in reversed(rows):
+                        if isinstance(row, (list, tuple)) and len(row) > index and isinstance(row[index], (int, float)):
+                            entry["current_level"] = round(row[index])
+                            break
+
                 curated.append(entry)
 
             return json.dumps(curated, indent=2)
