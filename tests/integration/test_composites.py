@@ -190,3 +190,49 @@ async def test_training_week_totals_and_adherence(app_with_composites, mock_garm
     assert data["sessions"][0]["date"] == "2026-06-29"  # sorted oldest first
     assert data["load"]["acwr_status"] == "LOW"
     assert data["load"]["training_status"] == "RECOVERY_2"
+
+
+@pytest.mark.asyncio
+async def test_coach_report_trends_and_direction(app_with_composites, mock_garmin_client):
+    # today's load high, 4w ago low -> acute rising; give distinct snapshots by date
+    def status_for(date):
+        acute = {"2026-07-02": 130, "2026-06-18": 60, "2026-06-04": 40}.get(date, 100)
+        return {
+            "mostRecentTrainingStatus": {"latestTrainingStatusData": {"dev": {
+                "trainingStatusFeedbackPhrase": "PRODUCTIVE_1",
+                "acuteTrainingLoadDTO": {
+                    "dailyTrainingLoadAcute": acute, "dailyTrainingLoadChronic": 200,
+                    "dailyAcuteChronicWorkloadRatio": round(acute / 200, 2), "acwrStatus": "LOW",
+                    "minTrainingLoadChronic": 175.2, "maxTrainingLoadChronic": 328.5,
+                }}}},
+            "mostRecentVO2Max": {"generic": {"vo2MaxPreciseValue": 52.2 if date == "2026-07-02" else 51.0}, "cycling": None},
+        }
+    mock_garmin_client.get_training_status.side_effect = status_for
+    mock_garmin_client.get_max_metrics.side_effect = lambda d: [{"generic": {"vo2MaxPreciseValue": 52.2 if d == "2026-07-02" else 51.0}}]
+    mock_garmin_client.get_endurance_score.return_value = {"enduranceScoreDTO": {"overallScore": 5982}}
+
+    result = await app_with_composites.call_tool("get_coach_report", {"end_date": "2026-07-02", "weeks": 6})
+    data = json.loads(result[0][0].text)
+
+    assert data["readiness"]["score"] == 84
+    assert data["sleep_last_night"]["duration_h"] == 6.03
+    assert data["hrv"]["weekly_avg_ms"] == 70
+    assert data["body_battery"]["current_level"] == 64
+    assert data["adherence"]["days_since_last_session"] == 1
+    assert data["adherence"]["by_type_14d"] == {"running": 1, "strength_training": 1}
+    assert data["load"]["now"]["tsb"] == 70            # 200 - 130
+    assert data["load"]["acute_direction_4w"] == "rising"   # 130 vs 60
+    assert data["fitness"]["vo2max_now"] == 52.2
+    assert data["fitness"]["vo2max_change"] == 1.2     # 52.2 - 51.0
+    assert data["fitness"]["endurance_score"] == 5982
+    assert "errors" not in data
+
+
+@pytest.mark.asyncio
+async def test_coach_report_degrades_on_section_failure(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_endurance_score.side_effect = RuntimeError("500")
+    mock_garmin_client.get_max_metrics.return_value = [{"generic": {"vo2MaxValue": 52.0}}]
+    result = await app_with_composites.call_tool("get_coach_report", {"end_date": "2026-07-02"})
+    data = json.loads(result[0][0].text)
+    assert data["errors"]["fitness"] == "500"
+    assert data["readiness"]["score"] == 84  # rest still present
