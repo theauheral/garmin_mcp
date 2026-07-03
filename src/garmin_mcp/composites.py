@@ -119,6 +119,24 @@ def _load_position(date):
     )
 
 
+def _load_snapshot(date):
+    """Compact load position for one date incl. TSB (chronic - acute)."""
+    pos = _load_position(date)
+    acute, chronic = pos.get("acute_load"), pos.get("chronic_load")
+    if isinstance(acute, (int, float)) and isinstance(chronic, (int, float)):
+        pos["tsb"] = round(chronic - acute)
+    return pos
+
+
+def _direction(now, past):
+    if not isinstance(now, (int, float)) or not isinstance(past, (int, float)):
+        return None
+    delta = now - past
+    if abs(delta) < max(2.0, 0.05 * abs(past or 1)):
+        return "flat"
+    return "rising" if delta > 0 else "falling"
+
+
 def register_tools(app):
     """Register composite brief tools with the MCP server app"""
 
@@ -298,5 +316,129 @@ def register_tools(app):
         if errors:
             result["errors"] = errors
         return json.dumps(result, indent=2)
+
+    @app.tool()
+    async def get_coach_report(end_date: str, weeks: int = 6) -> str:
+        """Deep one-call training analysis for a dedicated coaching pass:
+        today's readiness/sleep/HRV/body-battery, adherence over the last 14
+        days (days_since_last_session, session counts by type, recent
+        sessions), training-load position vs Garmin's optimal band WITH
+        direction over 2 and 4 weeks (rising/falling/flat TSB and acute load),
+        and fitness trajectory (VO2 max change over ~4 weeks, endurance score,
+        HRV weekly average vs baseline). Heavier than get_wellness_brief —
+        intended for a once-daily coach run that reasons about trends, not
+        just today. Compare its numbers against the athlete's block targets.
+
+        Args:
+            end_date: Analysis date (usually today) in YYYY-MM-DD format
+            weeks: Trend lookback window for the endurance/fitness range (default 6)
+        """
+        end = datetime.date.fromisoformat(end_date)
+        d14 = (end - datetime.timedelta(days=13)).isoformat()
+        d2w = (end - datetime.timedelta(days=14)).isoformat()
+        d4w = (end - datetime.timedelta(days=28)).isoformat()
+        window_start = (end - datetime.timedelta(weeks=weeks)).isoformat()
+        report = {"as_of": end_date}
+        errors = {}
+
+        try:
+            r = next((e for e in (garmin_client.get_training_readiness(end_date) or []) if isinstance(e, dict)), {})
+            report["readiness"] = _drop_none(
+                {"score": r.get("score"), "level": r.get("level"), "feedback": r.get("feedbackShort")}
+            )
+        except Exception as e:
+            errors["readiness"] = str(e)
+
+        try:
+            sleep = garmin_client.get_sleep_data(end_date) or {}
+            dto = sleep.get("dailySleepDTO") or {}
+            dur = dto.get("sleepTimeSeconds")
+            report["sleep_last_night"] = _drop_none(
+                {
+                    "score": (dto.get("sleepScores") or {}).get("overall", {}).get("value"),
+                    "duration_h": _round(dur / 3600, 2) if isinstance(dur, (int, float)) else None,
+                    "resting_hr": sleep.get("restingHeartRate"),
+                    "overnight_hrv_ms": sleep.get("avgOvernightHrv"),
+                }
+            )
+        except Exception as e:
+            errors["sleep"] = str(e)
+
+        try:
+            hrv = (garmin_client.get_hrv_data(end_date) or {}).get("hrvSummary") or {}
+            baseline = hrv.get("baseline") or {}
+            report["hrv"] = _drop_none(
+                {
+                    "last_night_ms": hrv.get("lastNightAvg"),
+                    "weekly_avg_ms": hrv.get("weeklyAvg"),
+                    "balanced_low_ms": baseline.get("balancedLow"),
+                    "balanced_upper_ms": baseline.get("balancedUpper"),
+                    "status": hrv.get("status"),
+                }
+            )
+        except Exception as e:
+            errors["hrv"] = str(e)
+
+        try:
+            bb = next((d for d in (garmin_client.get_body_battery(end_date, end_date) or []) if isinstance(d, dict)), {})
+            report["body_battery"] = _drop_none({"current_level": _current_body_battery_level(bb)})
+        except Exception as e:
+            errors["body_battery"] = str(e)
+
+        try:
+            sessions = _sessions_between(d14, end_date)
+            last_7 = [s for s in sessions if s.get("date", "") >= (end - datetime.timedelta(days=6)).isoformat()]
+            by_type = {}
+            for s in sessions:
+                key = s.get("type") or "unknown"
+                by_type[key] = by_type.get(key, 0) + 1
+            report["adherence"] = _drop_none(
+                {
+                    "days_since_last_session": _days_since_last_session(sessions, end_date),
+                    "last_7d_sessions": len(last_7),
+                    "last_14d_sessions": len(sessions),
+                    "by_type_14d": by_type or None,
+                    "recent_sessions": sessions[-5:],
+                    "note": None if sessions else "no sessions recorded in the last 14 days",
+                }
+            )
+        except Exception as e:
+            errors["adherence"] = str(e)
+
+        try:
+            now = _load_snapshot(end_date)
+            ago2 = _load_snapshot(d2w)
+            ago4 = _load_snapshot(d4w)
+            report["load"] = _drop_none(
+                {
+                    "now": now,
+                    "2w_ago": _drop_none({"acute_load": ago2.get("acute_load"), "tsb": ago2.get("tsb")}) or None,
+                    "4w_ago": _drop_none({"acute_load": ago4.get("acute_load"), "tsb": ago4.get("tsb")}) or None,
+                    "acute_direction_4w": _direction(now.get("acute_load"), ago4.get("acute_load")),
+                    "tsb_direction_4w": _direction(now.get("tsb"), ago4.get("tsb")),
+                }
+            )
+        except Exception as e:
+            errors["load"] = str(e)
+
+        try:
+            vo2_now = ((garmin_client.get_max_metrics(end_date) or [{}])[0].get("generic") or {})
+            vo2_past = ((garmin_client.get_max_metrics(d4w) or [{}])[0].get("generic") or {})
+            now_v = vo2_now.get("vo2MaxPreciseValue") or vo2_now.get("vo2MaxValue")
+            past_v = vo2_past.get("vo2MaxPreciseValue") or vo2_past.get("vo2MaxValue")
+            fitness = {
+                "vo2max_now": now_v,
+                "vo2max_4w_ago": past_v,
+                "vo2max_change": _round(now_v - past_v, 1) if isinstance(now_v, (int, float)) and isinstance(past_v, (int, float)) else None,
+            }
+            score_dto = (garmin_client.get_endurance_score(window_start, end_date) or {}).get("enduranceScoreDTO") or {}
+            fitness["endurance_score"] = score_dto.get("overallScore") or score_dto.get("score")
+            report["fitness"] = _drop_none(fitness)
+        except Exception as e:
+            errors["fitness"] = str(e)
+
+        if errors:
+            report["errors"] = errors
+        return json.dumps(report, indent=2)
 
     return app
