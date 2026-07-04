@@ -255,6 +255,12 @@ def register_tools(app):
                     "resting_hr": sleep.get("restingHeartRate"),
                     "avg_overnight_hrv_ms": sleep.get("avgOvernightHrv"),
                     "body_battery_change": sleep.get("bodyBatteryChange"),
+                    "sleep_need_min": (dto.get("sleepNeed") or {}).get("actual"),
+                    "sleep_debt_min": (
+                        round((dto.get("sleepNeed") or {}).get("actual") - duration / 60)
+                        if isinstance((dto.get("sleepNeed") or {}).get("actual"), (int, float))
+                        and isinstance(duration, (int, float)) else None
+                    ),
                 }
             )
         except Exception as e:
@@ -539,6 +545,18 @@ def register_tools(app):
             result["pacing"] = _pacing(garmin_client.get_activity_typed_splits(aid))
         except Exception as e:
             errors["pacing"] = str(e)
+        try:
+            w = garmin_client.get_activity_weather(aid)
+            w = w if isinstance(w, dict) else {}
+            temp_c = round((w["temp"] - 32) * 5 / 9) if isinstance(w.get("temp"), (int, float)) else None
+            result["weather"] = _drop_none({
+                "temp_c": temp_c,
+                "humidity_pct": w.get("relativeHumidity"),
+                # heat inflates HR — flag so a warm run isn't misread as too-hard
+                "heat_note": "warm — HR runs higher, discount the zone read" if isinstance(temp_c, (int, float)) and temp_c >= 22 else None,
+            }) or None
+        except Exception as e:
+            errors["weather"] = str(e)
 
         if errors:
             result["errors"] = errors
@@ -601,6 +619,163 @@ def register_tools(app):
             }),
             "sessions": runs,
         }, indent=2)
+
+    @app.tool()
+    async def get_energy_curve(date: str) -> str:
+        """Intraday body-battery trajectory for energy-aware scheduling: hourly
+        energy levels, the peak window (best for demanding cognitive work) and
+        the trough (protect / recover), current level, and readiness. Use to
+        place deep work (e.g. LeetCode) at the energy peak and light/admin work
+        in the trough.
+
+        Args:
+            date: YYYY-MM-DD (usually today)
+        """
+        out = {"date": date}
+        errors = {}
+        offset_h = 0
+        try:
+            events = garmin_client.get_body_battery_events(date) or []
+            for e in events:
+                off = (e.get("event") or {}).get("timezoneOffset")
+                if isinstance(off, (int, float)):
+                    offset_h = off / 3600000
+                    break
+        except Exception:
+            pass
+        try:
+            bb = next((d for d in (garmin_client.get_body_battery(date, date) or []) if isinstance(d, dict)), {})
+            idx = _descriptor_index(bb.get("bodyBatteryValueDescriptorDTOList"), "bodyBatteryLevel", 2)
+            hourly = {}
+            for row in bb.get("bodyBatteryValuesArray") or []:
+                if isinstance(row, (list, tuple)) and len(row) > idx and isinstance(row[0], (int, float)) and isinstance(row[idx], (int, float)):
+                    hour = int(((row[0] / 1000) + offset_h * 3600) // 3600 % 24)
+                    hourly.setdefault(hour, []).append(row[idx])
+            curve = [{"hour": h, "level": round(fmean(v))} for h, v in sorted(hourly.items())]
+            out["current_level"] = _current_body_battery_level(bb)
+            out["hourly"] = curve
+            # best/worst 2-hour window
+            if len(curve) >= 2:
+                best = max(curve, key=lambda c: c["level"])
+                worst = min(curve, key=lambda c: c["level"])
+                out["peak_window"] = {"around_hour": best["hour"], "level": best["level"]}
+                out["trough_window"] = {"around_hour": worst["hour"], "level": worst["level"]}
+        except Exception as e:
+            errors["body_battery"] = str(e)
+        try:
+            r = next((e for e in (garmin_client.get_training_readiness(date) or []) if isinstance(e, dict)), {})
+            out["readiness"] = _drop_none({"score": r.get("score"), "level": r.get("level")})
+        except Exception as e:
+            errors["readiness"] = str(e)
+        if errors:
+            out["errors"] = errors
+        return json.dumps(out, indent=2)
+
+    @app.tool()
+    async def get_health_flags(date: str) -> str:
+        """Early-warning fusion of illness/overtraining signals for one date:
+        resting HR vs 7-day average, overnight HRV vs personal band, sleep debt
+        (slept vs Garmin's personalized need), respiration, SpO2 (if tracked),
+        and morning body battery. Returns severity green/amber/red plus which
+        signals are off. Use to catch a cold or over-reach before it's felt.
+
+        Args:
+            date: YYYY-MM-DD (usually today)
+        """
+        signals = {}
+        flags = []
+        errors = {}
+        try:
+            hr = garmin_client.get_heart_rates(date) or {}
+            rhr, avg7 = hr.get("restingHeartRate"), hr.get("lastSevenDaysAvgRestingHeartRate")
+            signals["resting_hr"] = rhr
+            signals["resting_hr_7d_avg"] = avg7
+            if isinstance(rhr, (int, float)) and isinstance(avg7, (int, float)) and rhr - avg7 >= 5:
+                flags.append(f"resting HR {rhr} is {rhr - avg7} over the 7-day average")
+        except Exception as e:
+            errors["heart_rate"] = str(e)
+        try:
+            hv = (garmin_client.get_hrv_data(date) or {}).get("hrvSummary") or {}
+            base = hv.get("baseline") or {}
+            last, low, wk = hv.get("lastNightAvg"), base.get("balancedLow"), hv.get("weeklyAvg")
+            signals["hrv_last_night"] = last
+            signals["hrv_status"] = hv.get("status")
+            if isinstance(last, (int, float)) and isinstance(low, (int, float)) and last < low:
+                flags.append(f"overnight HRV {last}ms below the balanced band ({low}ms)")
+            elif isinstance(last, (int, float)) and isinstance(wk, (int, float)) and last < 0.85 * wk:
+                flags.append(f"overnight HRV {last}ms well under the weekly average ({wk}ms)")
+        except Exception as e:
+            errors["hrv"] = str(e)
+        try:
+            sl = garmin_client.get_sleep_data(date) or {}
+            dto = sl.get("dailySleepDTO") or {}
+            slept = dto.get("sleepTimeSeconds")
+            need = (dto.get("sleepNeed") or {}).get("actual")  # minutes
+            if isinstance(slept, (int, float)) and isinstance(need, (int, float)):
+                debt_min = round(need - slept / 60)
+                signals["sleep_debt_min"] = debt_min
+                if debt_min >= 60:
+                    flags.append(f"slept {debt_min} min under your need last night")
+        except Exception as e:
+            errors["sleep"] = str(e)
+        try:
+            resp = garmin_client.get_respiration_data(date) or {}
+            signals["waking_respiration"] = resp.get("avgWakingRespirationValue")
+        except Exception:
+            pass
+        try:
+            spo2 = (garmin_client.get_spo2_data(date) or {}).get("averageSpO2")
+            if isinstance(spo2, (int, float)):
+                signals["avg_spo2"] = spo2
+                if spo2 < 90:
+                    flags.append(f"average SpO2 {spo2}% is low")
+        except Exception:
+            pass
+        severity = "red" if len(flags) >= 2 else "amber" if len(flags) == 1 else "green"
+        result = {"date": date, "severity": severity, "flags": flags, "signals": _drop_none(signals)}
+        if errors:
+            result["errors"] = errors
+        return json.dumps(result, indent=2)
+
+    @app.tool()
+    async def get_wins(days: int = 14) -> str:
+        """Recent wins for motivation/adherence: personal records set, badges
+        earned, current race predictions, and the recorded-activity streak over
+        the window. Use to celebrate progress in a briefing.
+
+        Args:
+            days: lookback window in days (default 14)
+        """
+        import datetime as _dt
+        cutoff = (_dt.date.today() - _dt.timedelta(days=days))
+        out = {"window_days": days}
+        errors = {}
+        try:
+            prs = garmin_client.get_personal_record() or []
+            recent = []
+            for p in prs:
+                ts = p.get("activityStartDateTimeInGMT")
+                d = None
+                if isinstance(ts, (int, float)):
+                    d = _dt.datetime.utcfromtimestamp(ts / 1000).date()
+                if d and d >= cutoff:
+                    recent.append(_drop_none({"activity": p.get("activityName"), "type": p.get("activityType"), "date": str(d)}))
+            out["recent_prs"] = recent
+        except Exception as e:
+            errors["prs"] = str(e)
+        try:
+            badges = garmin_client.get_earned_badges() or []
+            out["recent_badges"] = [b.get("badgeName") for b in badges[:5] if isinstance(b, dict)]
+        except Exception as e:
+            errors["badges"] = str(e)
+        try:
+            rp = garmin_client.get_race_predictions() or {}
+            out["race_prediction_5k"] = rp.get("time5K") or (rp.get("predictions") or {}).get("5K")
+        except Exception:
+            pass
+        if errors:
+            out["errors"] = errors
+        return json.dumps(out, indent=2)
 
     @app.tool()
     async def get_plan_context() -> str:
