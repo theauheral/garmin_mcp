@@ -9,6 +9,7 @@ failures are reported in an "errors" map instead of raising.
 
 import datetime
 import json
+from statistics import fmean
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -135,6 +136,61 @@ def _direction(now, past):
     if abs(delta) < max(2.0, 0.05 * abs(past or 1)):
         return "flat"
     return "rising" if delta > 0 else "falling"
+
+
+def _zone_distribution(zones):
+    """Summarize get_activity_hr_in_timezones output into easy vs hard share."""
+    if not isinstance(zones, list):
+        return None
+    total = sum(z.get("secsInZone", 0) or 0 for z in zones if isinstance(z, dict))
+    if total <= 0:
+        return None
+    by_zone = {}
+    easy = hard = 0.0
+    for z in zones:
+        if not isinstance(z, dict):
+            continue
+        n = z.get("zoneNumber")
+        secs = z.get("secsInZone", 0) or 0
+        by_zone[f"z{n}"] = {"min": round(secs / 60, 1), "pct": round(100 * secs / total)}
+        if isinstance(n, int):
+            if n <= 2:
+                easy += secs
+            else:
+                hard += secs
+    return {
+        "total_min": round(total / 60, 1),
+        "by_zone": by_zone,
+        "easy_share_pct": round(100 * easy / total),   # Z1-2 = aerobic/easy
+        "hard_share_pct": round(100 * hard / total),    # Z3+ = tempo and above
+    }
+
+
+def _pacing(splits):
+    """First-half vs second-half pace drift from typed splits (fade detection)."""
+    rows = []
+    items = splits.get("splits") if isinstance(splits, dict) else splits
+    if not isinstance(items, list):
+        return None
+    for s in items:
+        if not isinstance(s, dict):
+            continue
+        dist, dur = s.get("distance"), s.get("duration") or s.get("movingDuration")
+        if isinstance(dist, (int, float)) and dist > 0 and isinstance(dur, (int, float)):
+            rows.append({"km": round(dist / 1000, 2), "pace_s_per_km": round(dur / (dist / 1000)), "avg_hr": s.get("averageHR")})
+    if len(rows) < 2:
+        return None
+    half = len(rows) // 2
+    first = fmean(r["pace_s_per_km"] for r in rows[:half])
+    second = fmean(r["pace_s_per_km"] for r in rows[half:])
+    drift = round(100 * (second - first) / first, 1)
+    return {
+        "splits": rows,
+        "first_half_pace_s": round(first),
+        "second_half_pace_s": round(second),
+        "drift_pct": drift,   # + = slowed (positive split/fade), - = negative split
+        "shape": "negative_split" if drift < -1 else "faded" if drift > 3 else "even",
+    }
 
 
 def register_tools(app):
@@ -440,5 +496,97 @@ def register_tools(app):
         if errors:
             report["errors"] = errors
         return json.dumps(report, indent=2)
+
+    @app.tool()
+    async def get_session_analysis(date: str = "", activity_id: int = 0) -> str:
+        """Objective execution quality for one training session: HR time-in-zones
+        (easy vs hard share — did an "easy" run stay aerobic?), per-split pacing
+        with fade/negative-split detection, and the session summary. Pass a
+        `date` (analyses that day's main activity) or an explicit `activity_id`.
+        Use to audit whether a session was executed as intended — the key
+        discipline for aerobic-base building (easy runs must actually be easy).
+
+        Args:
+            date: YYYY-MM-DD to analyse that day's main activity (optional)
+            activity_id: explicit Garmin activity id (optional; overrides date)
+        """
+        result = {}
+        errors = {}
+        try:
+            if activity_id:
+                summary = garmin_client.get_activity(activity_id) or {}
+                aid = activity_id
+            else:
+                if date:
+                    acts = garmin_client.get_activities_by_date(date, date) or []
+                else:
+                    acts = garmin_client.get_activities(0, 1) or []
+                acts = [a for a in acts if isinstance(a, dict)]
+                if not acts:
+                    return json.dumps({"note": f"no activity found for {date or 'most recent'}"}, indent=2)
+                summary = acts[0]
+                aid = summary.get("activityId") or summary.get("activityId".lower())
+            result["session"] = _drop_none(_summarize_session(summary))
+            result["activity_id"] = aid
+        except Exception as e:
+            return json.dumps({"error": str(e)}, indent=2)
+
+        try:
+            result["hr_zones"] = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
+        except Exception as e:
+            errors["hr_zones"] = str(e)
+        try:
+            result["pacing"] = _pacing(garmin_client.get_activity_typed_splits(aid))
+        except Exception as e:
+            errors["pacing"] = str(e)
+
+        if errors:
+            result["errors"] = errors
+        return json.dumps(_drop_none(result), indent=2)
+
+    @app.tool()
+    async def get_plan_context() -> str:
+        """What structured training is prescribed/available: active Garmin plans
+        (if any), upcoming scheduled workouts, and the athlete's saved workout
+        library (name + id + type — real sessions that sync to the watch). Use
+        so the coach prescribes from real available workouts and reconciles any
+        active Garmin plan; if no active plan, the coach owns the periodization
+        itself (see plan.md)."""
+        out = {}
+        errors = {}
+        try:
+            plans = (garmin_client.get_training_plans() or {}).get("trainingPlanList", [])
+            active = [
+                _drop_none({
+                    "id": p.get("trainingPlanId"),
+                    "name": p.get("name"),
+                    "category": p.get("trainingPlanCategory"),
+                    "status": (p.get("trainingStatus") or {}).get("statusKey"),
+                    "weeks": p.get("durationInWeeks"),
+                    "avg_weekly_workouts": p.get("avgWeeklyWorkouts"),
+                })
+                for p in plans if isinstance(p, dict)
+            ]
+            out["active_plans"] = [p for p in active if p.get("status") not in ("Completed", "Cancelled")]
+            out["all_plans_count"] = len(active)
+            if not out["active_plans"]:
+                out["note"] = "no active Garmin plan — the coach owns periodization (plan.md)"
+        except Exception as e:
+            errors["plans"] = str(e)
+        try:
+            workouts = garmin_client.get_workouts(0, 30) or []
+            out["saved_workouts"] = [
+                _drop_none({
+                    "id": w.get("workoutId"),
+                    "name": w.get("workoutName"),
+                    "type": (w.get("sportType") or {}).get("sportTypeKey"),
+                })
+                for w in workouts if isinstance(w, dict)
+            ]
+        except Exception as e:
+            errors["saved_workouts"] = str(e)
+        if errors:
+            out["errors"] = errors
+        return json.dumps(out, indent=2)
 
     return app
