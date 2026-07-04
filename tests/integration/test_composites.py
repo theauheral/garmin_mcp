@@ -291,3 +291,28 @@ async def test_plan_context_filters_completed_and_lists_workouts(app_with_compos
     assert "no active Garmin plan" in data["note"]
     assert data["saved_workouts"][0]["name"] == "The Hotel Workout"
     assert data["saved_workouts"][0]["id"] == 1470743108
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_classifies_and_detects_monotony(app_with_composites, mock_garmin_client):
+    # 3 runs, same distance (monotony); zones make them hard/hard/easy
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-07-03 19:25", "distance": 7200, "averageHR": 166, "aerobicTrainingEffect": 4.2},
+        {"activityId": 2, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-07-01 14:31", "distance": 7200, "averageHR": 165, "aerobicTrainingEffect": 4.0},
+        {"activityId": 3, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-06-28 10:00", "distance": 7200, "averageHR": 140, "aerobicTrainingEffect": 2.5},
+    ]
+    def zones_for(aid):
+        if aid == 3:  # easy run
+            return [{"zoneNumber": 1, "secsInZone": 300}, {"zoneNumber": 2, "secsInZone": 1500}, {"zoneNumber": 3, "secsInZone": 200}]
+        return [{"zoneNumber": 3, "secsInZone": 200}, {"zoneNumber": 4, "secsInZone": 2000}]  # hard
+    mock_garmin_client.get_activity_hr_in_timezones.side_effect = zones_for
+
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 3})
+    data = json.loads(result[0][0].text)
+
+    assert data["analysed"] == 3
+    assert data["distribution"]["hard"] == 2
+    assert data["distribution"]["easy"] == 1
+    assert data["monotony"]["distinct_distances"] == 1     # all 7.2km — monotone
+    assert data["sessions"][0]["execution"] == "hard"
+    assert data["sessions"][2]["execution"] == "easy"
