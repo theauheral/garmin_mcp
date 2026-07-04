@@ -316,3 +316,62 @@ async def test_execution_trend_classifies_and_detects_monotony(app_with_composit
     assert data["monotony"]["distinct_distances"] == 1     # all 7.2km — monotone
     assert data["sessions"][0]["execution"] == "hard"
     assert data["sessions"][2]["execution"] == "easy"
+
+
+@pytest.mark.asyncio
+async def test_health_flags_fuses_signals(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_heart_rates.return_value = {"restingHeartRate": 55, "lastSevenDaysAvgRestingHeartRate": 47}
+    mock_garmin_client.get_hrv_data.return_value = {"hrvSummary": {"lastNightAvg": 50, "weeklyAvg": 70, "status": "UNBALANCED", "baseline": {"balancedLow": 55}}}
+    mock_garmin_client.get_sleep_data.return_value = {"dailySleepDTO": {"sleepTimeSeconds": 18000, "sleepNeed": {"actual": 510}}}
+    mock_garmin_client.get_respiration_data.return_value = {"avgWakingRespirationValue": 15}
+    mock_garmin_client.get_spo2_data.return_value = {"averageSpO2": None}
+    result = await app_with_composites.call_tool("get_health_flags", {"date": "2026-07-04"})
+    data = json.loads(result[0][0].text)
+    assert data["severity"] == "red"        # RHR + HRV + sleep debt all off
+    assert len(data["flags"]) >= 2
+    assert data["signals"]["sleep_debt_min"] == 510 - 300
+
+
+@pytest.mark.asyncio
+async def test_health_flags_green_when_clear(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_heart_rates.return_value = {"restingHeartRate": 46, "lastSevenDaysAvgRestingHeartRate": 47}
+    mock_garmin_client.get_hrv_data.return_value = {"hrvSummary": {"lastNightAvg": 72, "weeklyAvg": 70, "baseline": {"balancedLow": 55}}}
+    mock_garmin_client.get_sleep_data.return_value = {"dailySleepDTO": {"sleepTimeSeconds": 28800, "sleepNeed": {"actual": 480}}}
+    mock_garmin_client.get_respiration_data.return_value = {"avgWakingRespirationValue": 14}
+    mock_garmin_client.get_spo2_data.return_value = {"averageSpO2": 96}
+    result = await app_with_composites.call_tool("get_health_flags", {"date": "2026-07-04"})
+    data = json.loads(result[0][0].text)
+    assert data["severity"] == "green"
+    assert data["flags"] == []
+
+
+@pytest.mark.asyncio
+async def test_energy_curve_finds_peak_and_trough(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_body_battery_events.return_value = [{"event": {"timezoneOffset": 0}}]
+    mock_garmin_client.get_body_battery.return_value = [{
+        "bodyBatteryValueDescriptorDTOList": [
+            {"bodyBatteryValueDescriptorIndex": 0, "bodyBatteryValueDescriptorKey": "timestamp"},
+            {"bodyBatteryValueDescriptorIndex": 2, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+        ],
+        "bodyBatteryValuesArray": [
+            [3600 * 1000, "M", 80],    # 01:00 UTC — high
+            [10 * 3600 * 1000, "M", 30],  # 10:00 UTC — low
+        ],
+    }]
+    mock_garmin_client.get_training_readiness.return_value = [{"score": 70, "level": "MODERATE"}]
+    result = await app_with_composites.call_tool("get_energy_curve", {"date": "2026-07-04"})
+    data = json.loads(result[0][0].text)
+    assert data["peak_window"]["around_hour"] == 1
+    assert data["trough_window"]["around_hour"] == 10
+    assert data["readiness"]["score"] == 70
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_includes_weather(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = [{"zoneNumber": 4, "secsInZone": 2000}]
+    mock_garmin_client.get_activity_typed_splits.return_value = {"splits": []}
+    mock_garmin_client.get_activity_weather.return_value = {"temp": 81, "relativeHumidity": 28}
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-03"})
+    data = json.loads(result[0][0].text)
+    assert data["weather"]["temp_c"] == 27
+    assert "warm" in data["weather"]["heat_note"]
