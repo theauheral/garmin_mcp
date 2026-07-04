@@ -731,8 +731,15 @@ def register_tools(app):
                     flags.append(f"average SpO2 {spo2}% is low")
         except Exception:
             pass
-        severity = "red" if len(flags) >= 2 else "amber" if len(flags) == 1 else "green"
-        result = {"date": date, "severity": severity, "flags": flags, "signals": _drop_none(signals)}
+        signals = _drop_none(signals)
+        # Don't declare "green" when nothing was evaluable (e.g. today unsynced).
+        evaluated = any(k in signals for k in ("resting_hr", "hrv_last_night", "sleep_debt_min"))
+        if not evaluated:
+            result = {"date": date, "severity": "unknown", "flags": [],
+                      "note": "today's metrics haven't synced — re-check later or use yesterday", "signals": signals}
+        else:
+            severity = "red" if len(flags) >= 2 else "amber" if len(flags) == 1 else "green"
+            result = {"date": date, "severity": severity, "flags": flags, "signals": signals}
         if errors:
             result["errors"] = errors
         return json.dumps(result, indent=2)

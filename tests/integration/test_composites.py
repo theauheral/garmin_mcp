@@ -375,3 +375,16 @@ async def test_session_analysis_includes_weather(app_with_composites, mock_garmi
     data = json.loads(result[0][0].text)
     assert data["weather"]["temp_c"] == 27
     assert "warm" in data["weather"]["heat_note"]
+
+
+@pytest.mark.asyncio
+async def test_health_flags_unknown_when_unsynced(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_heart_rates.return_value = {}
+    mock_garmin_client.get_hrv_data.return_value = {}
+    mock_garmin_client.get_sleep_data.return_value = {}
+    mock_garmin_client.get_respiration_data.return_value = {}
+    mock_garmin_client.get_spo2_data.return_value = {}
+    result = await app_with_composites.call_tool("get_health_flags", {"date": "2026-07-04"})
+    data = json.loads(result[0][0].text)
+    assert data["severity"] == "unknown"
+    assert "synced" in data["note"]
