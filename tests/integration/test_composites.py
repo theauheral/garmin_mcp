@@ -236,3 +236,58 @@ async def test_coach_report_degrades_on_section_failure(app_with_composites, moc
     data = json.loads(result[0][0].text)
     assert data["errors"]["fitness"] == "500"
     assert data["readiness"]["score"] == 84  # rest still present
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_hr_zones_and_pacing(app_with_composites, mock_garmin_client):
+    # real-shaped zone data: mostly Zone 4 (a "hard" run)
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = [
+        {"zoneNumber": 1, "secsInZone": 27.4, "zoneLowBoundary": 100},
+        {"zoneNumber": 2, "secsInZone": 141.8, "zoneLowBoundary": 120},
+        {"zoneNumber": 3, "secsInZone": 475.9, "zoneLowBoundary": 140},
+        {"zoneNumber": 4, "secsInZone": 2428.4, "zoneLowBoundary": 160},
+    ]
+    mock_garmin_client.get_activity_typed_splits.return_value = {"splits": [
+        {"distance": 1000, "duration": 330, "averageHR": 150},
+        {"distance": 1000, "duration": 335, "averageHR": 158},
+        {"distance": 1000, "duration": 350, "averageHR": 165},
+        {"distance": 1000, "duration": 360, "averageHR": 170},
+    ]}
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
+    data = json.loads(result[0][0].text)
+
+    assert data["activity_id"] == 1
+    z = data["hr_zones"]
+    assert z["easy_share_pct"] < 10       # only ~5% in Z1-2 — not an easy run
+    assert z["hard_share_pct"] > 90
+    assert z["by_zone"]["z4"]["pct"] > 70
+    p = data["pacing"]
+    assert p["shape"] == "faded"          # slowed in the second half
+    assert p["drift_pct"] > 3
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_no_activity(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activities_by_date.return_value = []
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-04"})
+    data = json.loads(result[0][0].text)
+    assert "no activity found" in data["note"]
+
+
+@pytest.mark.asyncio
+async def test_plan_context_filters_completed_and_lists_workouts(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_training_plans.return_value = {"trainingPlanList": [
+        {"trainingPlanId": 44144473, "name": "Strength Builder", "trainingPlanCategory": "STRENGTH",
+         "trainingStatus": {"statusKey": "Completed"}, "durationInWeeks": 4, "avgWeeklyWorkouts": 3},
+    ]}
+    mock_garmin_client.get_workouts.return_value = [
+        {"workoutId": 1470743108, "workoutName": "The Hotel Workout", "sportType": {"sportTypeKey": "strength_training"}},
+    ]
+    result = await app_with_composites.call_tool("get_plan_context", {})
+    data = json.loads(result[0][0].text)
+
+    assert data["active_plans"] == []                 # Completed filtered out
+    assert data["all_plans_count"] == 1
+    assert "no active Garmin plan" in data["note"]
+    assert data["saved_workouts"][0]["name"] == "The Hotel Workout"
+    assert data["saved_workouts"][0]["id"] == 1470743108
