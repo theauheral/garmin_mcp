@@ -545,6 +545,64 @@ def register_tools(app):
         return json.dumps(_drop_none(result), indent=2)
 
     @app.tool()
+    async def get_execution_trend(count: int = 10, activity_type: str = "running") -> str:
+        """Execution quality ACROSS the last N sessions of one type — surfaces
+        patterns a single-session view misses: how many runs were genuinely
+        easy (Z1-2) vs 'grey zone' (mostly Z3) vs hard (Z3+ heavy), the average
+        easy-share, and monotony (are they all the same distance/effort?). Use
+        for weekly review and to diagnose training distribution (e.g. the
+        classic 'every run is moderately hard' base-building failure).
+
+        Args:
+            count: number of recent sessions to analyse (default 10, ~N API calls)
+            activity_type: typeKey filter, e.g. running / cycling (default running)
+        """
+        try:
+            acts = garmin_client.get_activities(0, max(1, min(count * 2, 40))) or []
+        except Exception as e:
+            return json.dumps({"error": str(e)}, indent=2)
+        acts = [a for a in acts if isinstance(a, dict)
+                and (a.get("activityType") or {}).get("typeKey", "").find(activity_type) >= 0][:count]
+        runs = []
+        buckets = {"easy": 0, "grey": 0, "hard": 0, "unknown": 0}
+        for a in acts:
+            aid = a.get("activityId")
+            dist = a.get("distance")
+            row = {
+                "date": (a.get("startTimeLocal") or "")[:10],
+                "km": round(dist / 1000, 1) if isinstance(dist, (int, float)) else None,
+                "avg_hr": a.get("averageHR"),
+                "aerobic_te": round(a["aerobicTrainingEffect"], 1) if isinstance(a.get("aerobicTrainingEffect"), (int, float)) else None,
+            }
+            try:
+                z = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
+                if z:
+                    es = z["easy_share_pct"]
+                    row["easy_share_pct"] = es
+                    tag = "easy" if es >= 65 else "hard" if es < 35 else "grey"
+                else:
+                    tag = "unknown"
+            except Exception:
+                tag = "unknown"
+            row["execution"] = tag
+            buckets[tag] += 1
+            runs.append(_drop_none(row))
+        graded = [r for r in runs if r.get("easy_share_pct") is not None]
+        avg_easy = round(fmean(r["easy_share_pct"] for r in graded)) if graded else None
+        dists = [r["km"] for r in runs if r.get("km")]
+        return json.dumps({
+            "analysed": len(runs),
+            "activity_type": activity_type,
+            "distribution": buckets,
+            "avg_easy_share_pct": avg_easy,
+            "monotony": _drop_none({
+                "distinct_distances": len(set(dists)) if dists else None,
+                "distance_range_km": [min(dists), max(dists)] if dists else None,
+            }),
+            "sessions": runs,
+        }, indent=2)
+
+    @app.tool()
     async def get_plan_context() -> str:
         """What structured training is prescribed/available: active Garmin plans
         (if any), upcoming scheduled workouts, and the athlete's saved workout
