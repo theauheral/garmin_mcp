@@ -179,6 +179,134 @@ def _form_fatigue(rows):
     return out
 
 
+def _dto_source(activity):
+    """The summaryDTO dict when the payload is the get_activity wrapper,
+    else the payload itself (list shape)."""
+    if isinstance(activity, dict) and isinstance(activity.get("summaryDTO"), dict):
+        return activity["summaryDTO"]
+    return activity if isinstance(activity, dict) else {}
+
+
+def _effort_rating(activity):
+    """The athlete's own post-session rating from the watch prompt (RPE is
+    stored x10, feel is 0-100) plus the structured-workout compliance score.
+    summaryDTO-only fields — the list endpoints never carry them."""
+    src = _dto_source(activity)
+    rpe = _first_number(src, "directWorkoutRpe")
+    return {
+        "rpe_10": _round(rpe / 10) if rpe is not None else None,
+        "feel_pct": _first_number(src, "directWorkoutFeel"),
+        "compliance_score": _first_number(src, "directWorkoutComplianceScore"),
+    }
+
+
+def _session_cost(activity):
+    """What the session cost: Garmin stamina depletion (summaryDTO-only),
+    body-battery drain, and estimated sweat loss."""
+    src = _dto_source(activity)
+    sweat = _first_number(src, "waterEstimated")
+    return {
+        "stamina_start_pct": _round(_first_number(src, "beginPotentialStamina")),
+        "stamina_end_pct": _round(_first_number(src, "endPotentialStamina")),
+        "stamina_min_pct": _round(_first_number(src, "minAvailableStamina")),
+        "body_battery_drain": _first_number(src, "differenceBodyBattery"),
+        "sweat_loss_ml": round(sweat) if sweat is not None else None,
+    }
+
+
+def _terrain(activity):
+    """Climb and grade-adjusted pace — hills inflate raw pace, so judge
+    pacing off the adjusted number on lumpy routes."""
+    src = _dto_source(activity)
+    gas = _first_number(src, "avgGradeAdjustedSpeed")
+    return _drop_none({
+        "elev_gain_m": _round(_first_number(src, "elevationGain")),
+        "elev_loss_m": _round(_first_number(src, "elevationLoss")),
+        "grade_adjusted_pace_s_per_km": round(1000 / gas) if isinstance(gas, (int, float)) and gas > 0 else None,
+    }) or None
+
+
+def _power_share_from_list(activity):
+    """Easy-share by POWER zones from the flat powerTimeInZone_N list fields.
+    Power has no cardiac lag and no heat inflation, so it cross-checks the
+    HR-based read on warm or surging runs."""
+    if not isinstance(activity, dict):
+        return None
+    secs = {z: activity.get(f"powerTimeInZone_{z}") for z in range(1, 6)}
+    total = sum(v for v in secs.values() if isinstance(v, (int, float)))
+    if total <= 0:
+        return None
+    easy = sum(v for z, v in secs.items() if z <= 2 and isinstance(v, (int, float)))
+    return round(100 * easy / total)
+
+
+def _summarize_exercise_sets(payload):
+    """Compact strength view from get_activity_exercise_sets: what was
+    actually lifted. Auto-detected exercises are often unclassified; weight
+    arrives in grams, 0 = bodyweight."""
+    sets = payload.get("exerciseSets") if isinstance(payload, dict) else payload
+    if not isinstance(sets, list):
+        return None
+    active = [s for s in sets if isinstance(s, dict) and s.get("setType") == "ACTIVE"]
+    if not active:
+        return None
+    by_exercise = {}
+    total_reps = 0
+    active_sec = 0.0
+    for s in active:
+        cands = [e for e in s.get("exercises") or [] if isinstance(e, dict)]
+        best = max(cands, key=lambda e: e.get("probability") or 0, default={})
+        name = best.get("name") or best.get("category") or "UNKNOWN"
+        if name == "UNKNOWN":
+            name = "unclassified"
+        entry = by_exercise.setdefault(name, {"sets": 0, "reps": 0, "max_weight_kg": None})
+        entry["sets"] += 1
+        reps = s.get("repetitionCount")
+        if isinstance(reps, (int, float)):
+            entry["reps"] += round(reps)
+            total_reps += round(reps)
+        w = s.get("weight")
+        if isinstance(w, (int, float)) and w > 0:
+            entry["max_weight_kg"] = max(entry["max_weight_kg"] or 0, round(w / 1000, 1))
+        dur = s.get("duration")
+        if isinstance(dur, (int, float)):
+            active_sec += dur
+    return {
+        "total_sets": len(active),
+        "total_reps": total_reps or None,
+        "active_min": round(active_sec / 60, 1) if active_sec else None,
+        "by_exercise": {k: _drop_none(v) for k, v in by_exercise.items()},
+    }
+
+
+def _performance_condition(details):
+    """Start-vs-late performance condition from the details time series —
+    Garmin's rolling freshness delta vs baseline; sliding late in a run is
+    a durability signal."""
+    if not isinstance(details, dict):
+        return None
+    idx = None
+    for d in details.get("metricDescriptors") or []:
+        if isinstance(d, dict) and d.get("key") == "directPerformanceCondition":
+            idx = d.get("metricsIndex")
+    if not isinstance(idx, int):
+        return None
+    vals = []
+    for row in details.get("activityDetailMetrics") or []:
+        m = row.get("metrics") if isinstance(row, dict) else None
+        if isinstance(m, list) and len(m) > idx and isinstance(m[idx], (int, float)):
+            vals.append(m[idx])
+    if not vals:
+        return None
+    return {
+        "start": _round(vals[0]),
+        "end": _round(vals[-1]),
+        "min": _round(min(vals)),
+        "max": _round(max(vals)),
+        "delta": _round(vals[-1] - vals[0]),
+    }
+
+
 def _sessions_between(start_date, end_date):
     activities = garmin_client.get_activities_by_date(start_date, end_date) or []
     sessions = [_drop_none(_summarize_session(a)) for a in activities if isinstance(a, dict)]
@@ -231,8 +359,10 @@ def _direction(now, past):
     return "rising" if delta > 0 else "falling"
 
 
-def _zone_distribution(zones):
-    """Summarize get_activity_hr_in_timezones output into easy vs hard share."""
+def _zone_distribution(zones, boundary_key="low_bpm"):
+    """Summarize a Garmin time-in-zones payload (HR or power — same shape)
+    into easy vs hard share. boundary_key labels zoneLowBoundary in the
+    output: bpm for HR zones, watts for power zones."""
     if not isinstance(zones, list):
         return None
     total = sum(z.get("secsInZone", 0) or 0 for z in zones if isinstance(z, dict))
@@ -250,7 +380,7 @@ def _zone_distribution(zones):
             "pct": round(100 * secs / total),
             # which zone model was applied — boundaries must be visible, or
             # easy/hard share is uninterpretable
-            "low_bpm": z.get("zoneLowBoundary"),
+            boundary_key: z.get("zoneLowBoundary"),
         }
         if isinstance(n, int):
             if n <= 2:
@@ -606,8 +736,12 @@ def register_tools(app):
     async def get_session_analysis(date: str = "", activity_id: int = 0) -> str:
         """Objective execution quality for one training session: HR time-in-zones
         with zone boundaries (easy vs hard share — did an "easy" run stay
-        aerobic?), per-split pacing with fade/negative-split detection, average
-        cadence + stride length, and the session summary. Pass a
+        aerobic?), POWER time-in-zones (no cardiac lag or heat inflation — the
+        cross-check when HR looks hot), the athlete's own RPE/feel rating vs
+        the objective read, per-split pacing with fade/negative-split
+        detection, cadence + stride length, session cost (stamina, body
+        battery, sweat), terrain with grade-adjusted pace, and set/rep detail
+        for strength sessions. Pass a
         `date` (analyses that day's main activity) or an explicit `activity_id`.
         Use to audit whether a session was executed as intended — the key
         discipline for aerobic-base building (easy runs must actually be easy).
@@ -643,10 +777,36 @@ def register_tools(app):
             "stride_length_m": form["stride_length_m"],
         }) or None
 
+        # RPE/feel/stamina/compliance live only in the summaryDTO shape; the
+        # date path resolves from the flat list payload, so re-fetch the full
+        # activity for them.
+        dto = summary
+        if not isinstance(summary.get("summaryDTO"), dict):
+            try:
+                dto = garmin_client.get_activity(aid) or summary
+            except Exception:
+                dto = summary
+        result["effort"] = _drop_none(_effort_rating(dto)) or None
+        result["cost"] = _drop_none(_session_cost(dto)) or None
+        result["terrain"] = _terrain(dto)
+
         try:
             result["hr_zones"] = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
         except Exception as e:
             errors["hr_zones"] = str(e)
+        try:
+            result["power_zones"] = _zone_distribution(
+                garmin_client.get_activity_power_in_timezones(aid), boundary_key="low_w"
+            )
+        except Exception as e:
+            errors["power_zones"] = str(e)
+        if "strength" in (result["session"].get("type") or ""):
+            try:
+                result["strength_sets"] = _summarize_exercise_sets(
+                    garmin_client.get_activity_exercise_sets(aid)
+                )
+            except Exception as e:
+                errors["strength_sets"] = str(e)
         try:
             result["pacing"] = _pacing(garmin_client.get_activity_typed_splits(aid))
         except Exception as e:
@@ -672,13 +832,17 @@ def register_tools(app):
     async def get_running_dynamics(activity_id: int = 0, date: str = "") -> str:
         """Running-form metrics for one session: average/max cadence, stride
         length, vertical oscillation + ratio, ground contact time and L/R
-        balance, running power (avg + normalized), plus a per-lap cadence and
+        balance, running power (avg + normalized), a per-lap cadence and
         stride breakdown with a first-third vs last-third fatigue comparison
-        (does stride collapse late?). Fields the device didn't record are
-        null — wrist-based dynamics never report L/R balance. Pass an explicit
-        `activity_id`, a `date` (that day's main activity), or neither (most
-        recent activity). Use alongside get_session_analysis when the question
-        is form/economy rather than effort.
+        (does stride collapse late?), the session's cost (stamina depletion,
+        body-battery drain, sweat loss), terrain with grade-adjusted pace,
+        the athlete's own RPE/feel rating, and Garmin's performance-condition
+        curve (start vs end — a late slide is a durability signal). Fields
+        the device didn't record are null — wrist-based dynamics never report
+        L/R balance. Pass an explicit `activity_id`, a `date` (that day's
+        main activity), or neither (most recent activity). Use alongside
+        get_session_analysis when the question is form/economy rather than
+        effort.
 
         Args:
             activity_id: explicit Garmin activity id (optional; overrides date)
@@ -711,6 +875,24 @@ def register_tools(app):
             form["gct_balance_note"] = "L/R balance needs a chest strap or RD pod; wrist dynamics don't record it"
         result["form"] = form
 
+        # Stamina/RPE/feel are summaryDTO-only — re-fetch on the list path.
+        dto = summary
+        if not isinstance(summary.get("summaryDTO"), dict):
+            try:
+                dto = garmin_client.get_activity(aid) or summary
+            except Exception:
+                dto = summary
+        result["effort"] = _drop_none(_effort_rating(dto)) or None
+        result["cost"] = _drop_none(_session_cost(dto)) or None
+        result["terrain"] = _terrain(dto)
+
+        try:
+            result["performance_condition"] = _performance_condition(
+                garmin_client.get_activity_details(aid, maxchart=200, maxpoly=100)
+            )
+        except Exception as e:
+            errors["performance_condition"] = str(e)
+
         try:
             rows = _lap_form_rows(garmin_client.get_activity_splits(aid))
             if rows:
@@ -729,12 +911,14 @@ def register_tools(app):
         patterns a single-session view misses: how many runs were genuinely
         easy (Z1-2) vs 'grey zone' (mostly Z3) vs hard (Z3+ heavy), the average
         easy-share, per-run cadence + stride length (form drift across weeks),
-        and monotony (are they all the same distance/effort?). Use
+        per-run power easy-share and the athlete's own RPE (perception vs
+        objective effort — the calibration gap), and monotony (are they all
+        the same distance/effort?). Use
         for weekly review and to diagnose training distribution (e.g. the
         classic 'every run is moderately hard' base-building failure).
 
         Args:
-            count: number of recent sessions to analyse (default 10, ~N API calls)
+            count: number of recent sessions to analyse (default 10, ~2N API calls)
             activity_type: typeKey filter, e.g. running / cycling (default running)
         """
         try:
@@ -755,8 +939,13 @@ def register_tools(app):
                 "avg_hr": a.get("averageHR"),
                 "cadence_spm": form["cadence_spm"],
                 "stride_length_m": form["stride_length_m"],
+                "power_easy_share_pct": _power_share_from_list(a),
                 "aerobic_te": round(a["aerobicTrainingEffect"], 1) if isinstance(a.get("aerobicTrainingEffect"), (int, float)) else None,
             }
+            try:
+                row["rpe_10"] = _effort_rating(garmin_client.get_activity(aid) or {})["rpe_10"]
+            except Exception:
+                pass
             try:
                 z = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
                 if z:
