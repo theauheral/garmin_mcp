@@ -1,4 +1,5 @@
-"""Tests for the composite brief tools (get_wellness_brief, get_training_week)."""
+"""Tests for the composite brief/coaching tools (wellness brief, training week,
+coach report, session analysis, running dynamics, execution trend, ...)."""
 
 import json
 
@@ -247,11 +248,11 @@ async def test_session_analysis_hr_zones_and_pacing(app_with_composites, mock_ga
         {"zoneNumber": 3, "secsInZone": 475.9, "zoneLowBoundary": 140},
         {"zoneNumber": 4, "secsInZone": 2428.4, "zoneLowBoundary": 160},
     ]
-    mock_garmin_client.get_activity_typed_splits.return_value = {"splits": [
-        {"distance": 1000, "duration": 330, "averageHR": 150},
-        {"distance": 1000, "duration": 335, "averageHR": 158},
-        {"distance": 1000, "duration": 350, "averageHR": 165},
-        {"distance": 1000, "duration": 360, "averageHR": 170},
+    mock_garmin_client.get_activity_splits.return_value = {"lapDTOs": [
+        {"lapIndex": 1, "distance": 1000, "duration": 330, "averageHR": 150},
+        {"lapIndex": 2, "distance": 1000, "duration": 335, "averageHR": 158},
+        {"lapIndex": 3, "distance": 1000, "duration": 350, "averageHR": 165},
+        {"lapIndex": 4, "distance": 1000, "duration": 360, "averageHR": 170},
     ]}
     result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
     data = json.loads(result[0][0].text)
@@ -369,12 +370,242 @@ async def test_energy_curve_finds_peak_and_trough(app_with_composites, mock_garm
 @pytest.mark.asyncio
 async def test_session_analysis_includes_weather(app_with_composites, mock_garmin_client):
     mock_garmin_client.get_activity_hr_in_timezones.return_value = [{"zoneNumber": 4, "secsInZone": 2000}]
-    mock_garmin_client.get_activity_typed_splits.return_value = {"splits": []}
+    mock_garmin_client.get_activity_splits.return_value = {"lapDTOs": []}
     mock_garmin_client.get_activity_weather.return_value = {"temp": 81, "relativeHumidity": 28}
     result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-03"})
     data = json.loads(result[0][0].text)
     assert data["weather"]["temp_c"] == 27
     assert "warm" in data["weather"]["heat_note"]
+
+
+# --- running form / dynamics fixtures (shapes recorded from live payloads) ---
+
+RUN_ACTIVITY_WRAPPER = {  # get_activity() shape: numbers nested under summaryDTO
+    "activityId": 42,
+    "activityName": "City of Westminster Run",
+    "activityTypeDTO": {"typeKey": "running"},
+    "eventTypeDTO": {"typeKey": "uncategorized"},
+    "summaryDTO": {
+        "startTimeLocal": "2026-08-23T18:24:21.0",
+        "distance": 7261.37, "duration": 2541.242, "averageHR": 143.0,
+        "activityTrainingLoad": 95.47, "trainingEffect": 3.4000000953674316,
+        "anaerobicTrainingEffect": 0.0,
+        "averageRunCadence": 166.953125, "maxRunCadence": 176.0,
+        "strideLength": 102.22999877929688,        # centimeters
+        "verticalOscillation": 8.790000152587892,  # centimeters
+        "verticalRatio": 8.609999656677246,
+        "groundContactTime": 272.79998779296875,
+        "averagePower": 319.0, "normalizedPower": 320.0,
+        "directWorkoutFeel": 100, "directWorkoutRpe": 20,  # RPE stored x10
+        "directWorkoutComplianceScore": 86,
+        "beginPotentialStamina": 100.0, "endPotentialStamina": 59.0,
+        "minAvailableStamina": 59.0, "differenceBodyBattery": -10,
+        "waterEstimated": 705.0,
+        "elevationGain": 35.0, "elevationLoss": 32.0,
+        "avgGradeAdjustedSpeed": 2.8480000495910645,
+    },
+}
+
+RUN_LIST_ITEM = {  # get_activities*() flat shape — same metrics, different names
+    "activityId": 42,
+    "activityName": "City of Westminster Run",
+    "startTimeLocal": "2026-08-23 18:24:21",
+    "activityType": {"typeKey": "running"},
+    "distance": 7261.37, "duration": 2541.242, "averageHR": 143.0,
+    "aerobicTrainingEffect": 3.4,
+    "averageRunningCadenceInStepsPerMinute": 166.953125,
+    "maxRunningCadenceInStepsPerMinute": 176.0,
+    "avgStrideLength": 102.22999877929688,
+    "avgVerticalOscillation": 8.790000152587892,
+    "avgVerticalRatio": 8.609999656677246,
+    "avgGroundContactTime": 272.79998779296875,
+    "avgPower": 319.0, "normPower": 320.0,
+    "powerTimeInZone_1": 916.918, "powerTimeInZone_2": 1409.9,
+    "powerTimeInZone_3": 160.949, "powerTimeInZone_4": 24.049,
+    "powerTimeInZone_5": 4.0,
+}
+
+LAP_SPLITS = {"lapDTOs": [
+    {"lapIndex": 1, "distance": 1000.0, "duration": 340.0, "averageHR": 120.0,
+     "averageRunCadence": 162.1, "strideLength": 104.2},
+    {"lapIndex": 2, "distance": 1000.0, "duration": 345.0, "averageHR": 140.0,
+     "averageRunCadence": 167.3, "strideLength": 101.0},
+    {"lapIndex": 3, "distance": 1000.0, "duration": 372.0, "averageHR": 152.0,
+     "averageRunCadence": 168.8, "strideLength": 98.0},
+    {"lapIndex": 4, "distance": 200.0, "duration": 76.0, "averageHR": 155.0,
+     "averageRunCadence": 163.2, "strideLength": 96.0},
+]}
+
+POWER_ZONES = [
+    {"zoneNumber": 1, "secsInZone": 916.918, "zoneLowBoundary": 254},
+    {"zoneNumber": 2, "secsInZone": 1409.9, "zoneLowBoundary": 314},
+    {"zoneNumber": 3, "secsInZone": 160.949, "zoneLowBoundary": 353},
+    {"zoneNumber": 4, "secsInZone": 24.049, "zoneLowBoundary": 392},
+    {"zoneNumber": 5, "secsInZone": 4.0, "zoneLowBoundary": 450},
+]
+
+DETAILS = {
+    "metricDescriptors": [
+        {"metricsIndex": 0, "key": "directTimestamp"},
+        {"metricsIndex": 1, "key": "directPerformanceCondition"},
+    ],
+    "activityDetailMetrics": [
+        {"metrics": [0, None]}, {"metrics": [1, 0.0]}, {"metrics": [2, 4.0]},
+        {"metrics": [3, 2.0]}, {"metrics": [4, 1.0]},
+    ],
+}
+
+EXERCISE_SETS = {"exerciseSets": [
+    {"setType": "ACTIVE", "repetitionCount": 10, "weight": 20000.0, "duration": 40.0,
+     "exercises": [{"category": "CURL", "name": "BICEPS_CURL", "probability": 99.6},
+                   {"category": "UNKNOWN", "name": None, "probability": 0.4}]},
+    {"setType": "REST", "repetitionCount": None, "weight": None, "duration": 60.0,
+     "exercises": []},
+    {"setType": "ACTIVE", "repetitionCount": 12, "weight": 0.0, "duration": 35.0,
+     "exercises": [{"category": "UNKNOWN", "name": None, "probability": 99.0}]},
+]}
+
+
+@pytest.mark.asyncio
+async def test_running_dynamics_by_id_summary_dto_shape(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activity.return_value = RUN_ACTIVITY_WRAPPER
+    mock_garmin_client.get_activity_splits.return_value = LAP_SPLITS
+    mock_garmin_client.get_activity_details.return_value = DETAILS
+    result = await app_with_composites.call_tool("get_running_dynamics", {"activity_id": 42})
+    data = json.loads(result[0][0].text)
+
+    assert data["session"]["distance_km"] == 7.26   # summaryDTO flattened
+    assert data["session"]["aerobic_te"] == 3.4     # trainingEffect alias, rounded
+    f = data["form"]
+    assert f["cadence_spm"] == 167.0
+    assert f["stride_length_m"] == 1.02             # cm -> m
+    assert f["vertical_oscillation_cm"] == 8.8
+    assert f["ground_contact_time_ms"] == 272.8
+    assert f["normalized_power_w"] == 320.0
+    assert f["gct_balance_pct"] is None             # wrist dynamics: no L/R
+    assert "chest strap" in f["gct_balance_note"]
+    assert data["effort"] == {"rpe_10": 2.0, "feel_pct": 100, "compliance_score": 86}
+    assert data["cost"]["stamina_end_pct"] == 59.0
+    assert data["cost"]["sweat_loss_ml"] == 705
+    assert data["terrain"]["grade_adjusted_pace_s_per_km"] == 351
+    assert data["performance_condition"] == {
+        "start": 0.0, "end": 1.0, "min": 0.0, "max": 4.0, "delta": 1.0}
+    assert [r["lap"] for r in data["by_lap"]] == [1, 2, 3, 4]
+    assert data["by_lap"][0]["stride_length_m"] == 1.04
+    assert data["fatigue"]["first_third"]["cadence_spm"] == 162.1
+    assert data["fatigue"]["last_third"]["cadence_spm"] == 163.2
+    assert data["fatigue"]["stride_drift_pct"] == -7.7
+
+
+@pytest.mark.asyncio
+async def test_running_dynamics_list_shape_refetches_for_effort(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activities_by_date.return_value = [RUN_LIST_ITEM]
+    mock_garmin_client.get_activity.return_value = RUN_ACTIVITY_WRAPPER  # the re-fetch
+    mock_garmin_client.get_activity_splits.return_value = LAP_SPLITS
+    mock_garmin_client.get_activity_details.return_value = DETAILS
+    result = await app_with_composites.call_tool("get_running_dynamics", {"date": "2026-08-23"})
+    data = json.loads(result[0][0].text)
+
+    assert data["form"]["cadence_spm"] == 167.0     # list-endpoint field names
+    assert data["form"]["normalized_power_w"] == 320.0
+    assert data["effort"]["rpe_10"] == 2.0          # via the summaryDTO re-fetch
+    mock_garmin_client.get_activity.assert_called_once_with(42)
+
+
+@pytest.mark.asyncio
+async def test_running_dynamics_degrades_to_null(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activity.return_value = {
+        "activityId": 7, "activityName": "Pool Swim",
+        "summaryDTO": {"distance": 1000.0, "duration": 1800.0}}
+    mock_garmin_client.get_activity_splits.side_effect = RuntimeError("404")
+    mock_garmin_client.get_activity_details.return_value = {}
+    result = await app_with_composites.call_tool("get_running_dynamics", {"activity_id": 7})
+    data = json.loads(result[0][0].text)
+
+    for key in ("cadence_spm", "stride_length_m", "vertical_oscillation_cm",
+                "vertical_ratio_pct", "ground_contact_time_ms", "gct_balance_pct",
+                "avg_power_w", "normalized_power_w"):
+        assert data["form"][key] is None
+    assert data["effort"] is None and data["cost"] is None
+    assert data["performance_condition"] is None
+    assert "by_lap" not in data
+    assert data["errors"]["laps"] == "404"
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_zone_boundaries_power_and_effort(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activities_by_date.return_value = [RUN_LIST_ITEM]
+    mock_garmin_client.get_activity.return_value = RUN_ACTIVITY_WRAPPER
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = [
+        {"zoneNumber": 1, "secsInZone": 310.8, "zoneLowBoundary": 99},
+        {"zoneNumber": 2, "secsInZone": 208.0, "zoneLowBoundary": 118},
+        {"zoneNumber": 3, "secsInZone": 1893.4, "zoneLowBoundary": 139},
+    ]
+    mock_garmin_client.get_activity_power_in_timezones.return_value = POWER_ZONES
+    mock_garmin_client.get_activity_splits.return_value = LAP_SPLITS
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-08-23"})
+    data = json.loads(result[0][0].text)
+
+    assert data["hr_zones"]["by_zone"]["z3"]["low_bpm"] == 139   # boundaries visible
+    assert data["power_zones"]["by_zone"]["z2"]["low_w"] == 314  # watts, not bpm
+    assert data["power_zones"]["easy_share_pct"] == 92           # vs 21% by HR
+    assert data["form"] == {"cadence_spm": 167.0, "stride_length_m": 1.02}
+    assert data["effort"]["rpe_10"] == 2.0
+    assert data["cost"]["body_battery_drain"] == -10
+    assert data["pacing"]["shape"] == "faded"
+
+
+@pytest.mark.asyncio
+async def test_pacing_is_distance_weighted(app_with_composites, mock_garmin_client):
+    # 3 even km + a short slow tail lap: unweighted halves would call this a
+    # fade; distance-weighted lap pacing reads it as even.
+    mock_garmin_client.get_activities_by_date.return_value = [RUN_LIST_ITEM]
+    mock_garmin_client.get_activity_splits.return_value = {"lapDTOs": [
+        {"distance": 1000.0, "duration": 350.0},
+        {"distance": 1000.0, "duration": 350.0},
+        {"distance": 1000.0, "duration": 352.0},
+        {"distance": 120.0, "duration": 50.0},   # 417 s/km, but only 120 m
+    ]}
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-08-23"})
+    data = json.loads(result[0][0].text)
+    assert data["pacing"]["shape"] == "even"
+    assert data["pacing"]["drift_pct"] < 3
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_strength_sets(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activities_by_date.return_value = [{
+        "activityId": 9, "activityName": "Strength",
+        "startTimeLocal": "2026-08-21 20:02:00",
+        "activityType": {"typeKey": "strength_training"}, "duration": 1380.0,
+    }]
+    mock_garmin_client.get_activity_exercise_sets.return_value = EXERCISE_SETS
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-08-21"})
+    data = json.loads(result[0][0].text)
+
+    s = data["strength_sets"]
+    assert s["total_sets"] == 2                     # ACTIVE only, REST excluded
+    assert s["total_reps"] == 22
+    assert s["by_exercise"]["BICEPS_CURL"] == {"sets": 1, "reps": 10, "max_weight_kg": 20.0}
+    assert s["by_exercise"]["unclassified"] == {"sets": 1, "reps": 12}  # bodyweight
+    mock_garmin_client.get_activity_exercise_sets.assert_called_once_with(9)
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_rows_carry_form_power_and_rpe(app_with_composites, mock_garmin_client):
+    mock_garmin_client.get_activities.return_value = [RUN_LIST_ITEM]
+    mock_garmin_client.get_activity.return_value = RUN_ACTIVITY_WRAPPER
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = [
+        {"zoneNumber": 2, "secsInZone": 600}, {"zoneNumber": 3, "secsInZone": 1400}]
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 1})
+    data = json.loads(result[0][0].text)
+
+    row = data["sessions"][0]
+    assert row["cadence_spm"] == 167.0
+    assert row["stride_length_m"] == 1.02
+    assert row["power_easy_share_pct"] == 92        # from the flat list fields
+    assert row["rpe_10"] == 2.0                     # perception vs objective
+    assert row["easy_share_pct"] == 30
 
 
 @pytest.mark.asyncio
