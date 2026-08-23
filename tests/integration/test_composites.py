@@ -194,6 +194,43 @@ async def test_training_week_totals_and_adherence(app_with_composites, mock_garm
 
 
 @pytest.mark.asyncio
+async def test_load_position_prefers_primary_training_device(app_with_composites, mock_garmin_client):
+    # Two paired devices: a stale secondary listed FIRST (insertion order) with
+    # explicit-null sections, the primary second with the real load data.
+    mock_garmin_client.get_training_status.return_value = {
+        "mostRecentTrainingStatus": {
+            "latestTrainingStatusData": {
+                "111": {
+                    "primaryTrainingDevice": False,
+                    "trainingStatusFeedbackPhrase": None,
+                    "acuteTrainingLoadDTO": None,
+                },
+                "222": {
+                    "primaryTrainingDevice": True,
+                    "trainingStatusFeedbackPhrase": "PRODUCTIVE_1",
+                    "acuteTrainingLoadDTO": {
+                        "dailyTrainingLoadAcute": 120,
+                        "dailyTrainingLoadChronic": 240,
+                        "dailyAcuteChronicWorkloadRatio": 0.5,
+                        "acwrStatus": "OPTIMAL",
+                        "minTrainingLoadChronic": 175.2,
+                        "maxTrainingLoadChronic": 328.5,
+                    },
+                },
+            }
+        },
+        "mostRecentVO2Max": {"generic": {"vo2MaxValue": 52.0}, "cycling": None},
+    }
+
+    result = await app_with_composites.call_tool("get_training_week", {"end_date": "2026-07-02"})
+    data = json.loads(result[0][0].text)
+
+    assert data["load"]["training_status"] == "PRODUCTIVE_1"
+    assert data["load"]["acute_load"] == 120
+    assert data["load"]["acwr_status"] == "OPTIMAL"
+
+
+@pytest.mark.asyncio
 async def test_coach_report_trends_and_direction(app_with_composites, mock_garmin_client):
     # today's load high, 4w ago low -> acute rising; give distinct snapshots by date
     def status_for(date):

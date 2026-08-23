@@ -348,11 +348,28 @@ def _days_since_last_session(sessions, as_of):
     return (datetime.date.fromisoformat(as_of) - last).days
 
 
+def _primary_device_entry(device_map):
+    """Pick from a device-id-keyed map, preferring the primary training
+    device and falling back to the first entry — the same selection as
+    upstream's training-status tools."""
+    entry = {}
+    if not isinstance(device_map, dict):
+        return entry
+    for dev_data in device_map.values():
+        if not isinstance(dev_data, dict):
+            continue
+        if dev_data.get("primaryTrainingDevice"):
+            return dev_data
+        if not entry:
+            entry = dev_data
+    return entry
+
+
 def _load_position(date):
     """Acute load vs Garmin's optimal tunnel, via the training status endpoint."""
     data = garmin_client.get_training_status(date) or {}
     latest_map = (data.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}
-    entry = next(iter(latest_map.values()), {}) if isinstance(latest_map, dict) else {}
+    entry = _primary_device_entry(latest_map)
     acwr = entry.get("acuteTrainingLoadDTO") or {}
     return _drop_none(
         {
