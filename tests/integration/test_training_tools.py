@@ -1195,3 +1195,87 @@ async def test_get_acclimation_exception(app_with_training, mock_garmin_client):
     )
 
     assert "Error" in result[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_get_training_status_with_explicit_null_sections(app_with_training, mock_garmin_client):
+    """Real payloads carry explicit JSON nulls ("cycling": null for runners);
+    dict.get(key, {}) returns that None, so the tool must not crash on it.
+    Distinct from the missing-key test above — a suite with only that one
+    passed while production payloads crashed."""
+    status_with_nulls = {
+        "userId": 123,
+        "mostRecentVO2Max": {
+            "generic": {"vo2MaxValue": 52.0, "vo2MaxPreciseValue": 52.2},
+            "cycling": None,
+        },
+        "mostRecentTrainingLoadBalance": {
+            "metricsTrainingLoadBalanceDTOMap": None,
+        },
+        "mostRecentTrainingStatus": {
+            "latestTrainingStatusData": {
+                "3627784890": {
+                    "calendarDate": "2024-01-15",
+                    "trainingStatus": 5,
+                    "trainingStatusFeedbackPhrase": "RECOVERY_2",
+                    "acuteTrainingLoadDTO": None,
+                }
+            },
+        },
+    }
+    mock_garmin_client.get_training_status.return_value = status_with_nulls
+
+    result = await app_with_training.call_tool("get_training_status", {"date": "2024-01-15"})
+
+    assert "Error" not in result[0][0].text
+    data = json.loads(result[0][0].text)
+    assert data["training_status_feedback"] == "RECOVERY_2"
+    assert data["vo2_max"] == 52.0
+    assert "cycling_vo2_max" not in data  # null section stays absent, no crash
+
+
+@pytest.mark.asyncio
+async def test_get_training_load_trend_unwraps_device_map(app_with_training, mock_garmin_client):
+    """latestTrainingStatusData is keyed by device id; the trend must unwrap
+    the device entry — preferring the primary training device — or
+    ATL/CTL/TSB silently never populate."""
+    mock_garmin_client.get_training_status.return_value = {
+        "mostRecentVO2Max": {"generic": {"vo2MaxValue": 52.0}, "cycling": None},
+        "mostRecentTrainingStatus": {
+            "latestTrainingStatusData": {
+                # Stale secondary listed first: first-entry unwrapping would
+                # yield no load fields at all.
+                "111": {
+                    "primaryTrainingDevice": False,
+                    "trainingStatusFeedbackPhrase": None,
+                    "acuteTrainingLoadDTO": None,
+                },
+                "3627784890": {
+                    "primaryTrainingDevice": True,
+                    "calendarDate": "2024-01-15",
+                    "trainingStatusFeedbackPhrase": "PRODUCTIVE_1",
+                    "acuteTrainingLoadDTO": {
+                        "dailyTrainingLoadAcute": 85,
+                        "dailyTrainingLoadChronic": 219,
+                        "dailyAcuteChronicWorkloadRatio": 0.3,
+                        "acwrStatus": "LOW",
+                    },
+                },
+            },
+        },
+    }
+
+    result = await app_with_training.call_tool(
+        "get_training_load_trend",
+        {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+    )
+
+    data = json.loads(result[0][0].text)
+    day = data["trend"][0]
+    assert day["atl"] == 85
+    assert day["ctl"] == 219
+    assert day["tsb"] == 134
+    assert day["acwr"] == 0.3
+    assert day["acwr_status"] == "LOW"
+    assert day["training_status"] == "PRODUCTIVE_1"
+    assert day["vo2_max"] == 52.0
