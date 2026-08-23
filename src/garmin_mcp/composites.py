@@ -89,8 +89,8 @@ def _summarize_session(activity):
         "duration_min": _minutes(activity.get("duration")),
         "avg_hr": activity.get("averageHR"),
         "training_load": _round(activity.get("activityTrainingLoad")),
-        "aerobic_te": activity.get("aerobicTrainingEffect"),
-        "anaerobic_te": activity.get("anaerobicTrainingEffect"),
+        "aerobic_te": _round(activity.get("aerobicTrainingEffect")),
+        "anaerobic_te": _round(activity.get("anaerobicTrainingEffect")),
     }
 
 
@@ -115,9 +115,7 @@ def _form_metrics(activity):
     get_activity wrapper with summaryDTO). Garmin sends stride and vertical
     oscillation in centimeters. Every field is None when the device didn't
     record it; wrist-based dynamics never report L/R ground-contact balance."""
-    src = activity if isinstance(activity, dict) else {}
-    if isinstance(src.get("summaryDTO"), dict):
-        src = src["summaryDTO"]
+    src = _dto_source(activity)
     stride_cm = _first_number(src, "avgStrideLength", "strideLength")
     return {
         "cadence_spm": _round(_first_number(src, "averageRunningCadenceInStepsPerMinute", "averageRunCadence")),
@@ -307,6 +305,34 @@ def _performance_condition(details):
     }
 
 
+def _resolve_activity(activity_id, date):
+    """Resolve one activity to (summary_payload, activity_id, note): an
+    explicit id, else a date's main activity, else the most recent one.
+    note is set (and the payload None) when nothing was found."""
+    if activity_id:
+        return garmin_client.get_activity(activity_id) or {}, activity_id, None
+    if date:
+        acts = garmin_client.get_activities_by_date(date, date) or []
+    else:
+        acts = garmin_client.get_activities(0, 1) or []
+    acts = [a for a in acts if isinstance(a, dict)]
+    if not acts:
+        return None, None, f"no activity found for {date or 'most recent'}"
+    return acts[0], acts[0].get("activityId"), None
+
+
+def _full_activity(summary, aid):
+    """The summaryDTO-shaped payload for an already-resolved activity.
+    RPE/feel/stamina/compliance exist only in that shape, so when the
+    summary came from a flat list endpoint, re-fetch the full activity."""
+    if isinstance(summary.get("summaryDTO"), dict):
+        return summary
+    try:
+        return garmin_client.get_activity(aid) or summary
+    except Exception:
+        return summary
+
+
 def _sessions_between(start_date, end_date):
     activities = garmin_client.get_activities_by_date(start_date, end_date) or []
     sessions = [_drop_none(_summarize_session(a)) for a in activities if isinstance(a, dict)]
@@ -395,28 +421,38 @@ def _zone_distribution(zones, boundary_key="low_bpm"):
     }
 
 
-def _pacing(splits):
-    """First-half vs second-half pace drift from typed splits (fade detection)."""
-    rows = []
-    items = splits.get("splits") if isinstance(splits, dict) else splits
-    if not isinstance(items, list):
-        return None
-    for s in items:
-        if not isinstance(s, dict):
-            continue
-        dist, dur = s.get("distance"), s.get("duration") or s.get("movingDuration")
-        if isinstance(dist, (int, float)) and dist > 0 and isinstance(dur, (int, float)):
-            rows.append({"km": round(dist / 1000, 2), "pace_s_per_km": round(dur / (dist / 1000)), "avg_hr": s.get("averageHR")})
+def _pacing(lap_rows):
+    """First-half vs second-half pace drift from km laps (fade detection).
+    Laps are split at the distance midpoint and each half's pace is
+    distance-weighted — the typed-splits feed this used before mixes
+    run/walk/stand segments with whole-run aggregate rows, and an
+    unweighted mean over unequal distances misreads the drift."""
+    rows = [
+        r for r in lap_rows
+        if isinstance(r.get("km"), (int, float)) and r["km"] > 0
+        and isinstance(r.get("pace_s_per_km"), (int, float))
+    ]
     if len(rows) < 2:
         return None
-    half = len(rows) // 2
-    first = fmean(r["pace_s_per_km"] for r in rows[:half])
-    second = fmean(r["pace_s_per_km"] for r in rows[half:])
-    drift = round(100 * (second - first) / first, 1)
+    total_km = sum(r["km"] for r in rows)
+    half, cum = total_km / 2, 0.0
+    first, second = [], []
+    for r in rows:
+        (first if cum + r["km"] / 2 <= half else second).append(r)
+        cum += r["km"]
+    if not first or not second:
+        return None
+
+    def _pace(part):
+        km = sum(r["km"] for r in part)
+        return sum(r["pace_s_per_km"] * r["km"] for r in part) / km
+
+    fp, sp = _pace(first), _pace(second)
+    drift = round(100 * (sp - fp) / fp, 1)
     return {
         "splits": rows,
-        "first_half_pace_s": round(first),
-        "second_half_pace_s": round(second),
+        "first_half_pace_s": round(fp),
+        "second_half_pace_s": round(sp),
         "drift_pct": drift,   # + = slowed (positive split/fade), - = negative split
         "shape": "negative_split" if drift < -1 else "faded" if drift > 3 else "even",
     }
@@ -753,19 +789,9 @@ def register_tools(app):
         result = {}
         errors = {}
         try:
-            if activity_id:
-                summary = garmin_client.get_activity(activity_id) or {}
-                aid = activity_id
-            else:
-                if date:
-                    acts = garmin_client.get_activities_by_date(date, date) or []
-                else:
-                    acts = garmin_client.get_activities(0, 1) or []
-                acts = [a for a in acts if isinstance(a, dict)]
-                if not acts:
-                    return json.dumps({"note": f"no activity found for {date or 'most recent'}"}, indent=2)
-                summary = acts[0]
-                aid = summary.get("activityId") or summary.get("activityId".lower())
+            summary, aid, note = _resolve_activity(activity_id, date)
+            if note:
+                return json.dumps({"note": note}, indent=2)
             result["session"] = _drop_none(_summarize_session(summary))
             result["activity_id"] = aid
         except Exception as e:
@@ -777,15 +803,7 @@ def register_tools(app):
             "stride_length_m": form["stride_length_m"],
         }) or None
 
-        # RPE/feel/stamina/compliance live only in the summaryDTO shape; the
-        # date path resolves from the flat list payload, so re-fetch the full
-        # activity for them.
-        dto = summary
-        if not isinstance(summary.get("summaryDTO"), dict):
-            try:
-                dto = garmin_client.get_activity(aid) or summary
-            except Exception:
-                dto = summary
+        dto = _full_activity(summary, aid)
         result["effort"] = _drop_none(_effort_rating(dto)) or None
         result["cost"] = _drop_none(_session_cost(dto)) or None
         result["terrain"] = _terrain(dto)
@@ -808,7 +826,7 @@ def register_tools(app):
             except Exception as e:
                 errors["strength_sets"] = str(e)
         try:
-            result["pacing"] = _pacing(garmin_client.get_activity_typed_splits(aid))
+            result["pacing"] = _pacing(_lap_form_rows(garmin_client.get_activity_splits(aid)))
         except Exception as e:
             errors["pacing"] = str(e)
         try:
@@ -851,19 +869,9 @@ def register_tools(app):
         result = {}
         errors = {}
         try:
-            if activity_id:
-                summary = garmin_client.get_activity(activity_id) or {}
-                aid = activity_id
-            else:
-                if date:
-                    acts = garmin_client.get_activities_by_date(date, date) or []
-                else:
-                    acts = garmin_client.get_activities(0, 1) or []
-                acts = [a for a in acts if isinstance(a, dict)]
-                if not acts:
-                    return json.dumps({"note": f"no activity found for {date or 'most recent'}"}, indent=2)
-                summary = acts[0]
-                aid = summary.get("activityId")
+            summary, aid, note = _resolve_activity(activity_id, date)
+            if note:
+                return json.dumps({"note": note}, indent=2)
             result["session"] = _drop_none(_summarize_session(summary))
             result["activity_id"] = aid
         except Exception as e:
@@ -875,13 +883,7 @@ def register_tools(app):
             form["gct_balance_note"] = "L/R balance needs a chest strap or RD pod; wrist dynamics don't record it"
         result["form"] = form
 
-        # Stamina/RPE/feel are summaryDTO-only — re-fetch on the list path.
-        dto = summary
-        if not isinstance(summary.get("summaryDTO"), dict):
-            try:
-                dto = garmin_client.get_activity(aid) or summary
-            except Exception:
-                dto = summary
+        dto = _full_activity(summary, aid)
         result["effort"] = _drop_none(_effort_rating(dto)) or None
         result["cost"] = _drop_none(_session_cost(dto)) or None
         result["terrain"] = _terrain(dto)
@@ -1107,8 +1109,7 @@ def register_tools(app):
         Args:
             days: lookback window in days (default 14)
         """
-        import datetime as _dt
-        cutoff = (_dt.date.today() - _dt.timedelta(days=days))
+        cutoff = datetime.date.today() - datetime.timedelta(days=days)
         out = {"window_days": days}
         errors = {}
         try:
@@ -1118,7 +1119,7 @@ def register_tools(app):
                 ts = p.get("activityStartDateTimeInGMT")
                 d = None
                 if isinstance(ts, (int, float)):
-                    d = _dt.datetime.utcfromtimestamp(ts / 1000).date()
+                    d = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc).date()
                 if d and d >= cutoff:
                     recent.append(_drop_none({"activity": p.get("activityName"), "type": p.get("activityType"), "date": str(d)}))
             out["recent_prs"] = recent
