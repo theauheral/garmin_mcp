@@ -128,9 +128,10 @@ _COACHING_PROFILE = frozenset({
     "get_activity_fit_data",
     # activity_management
     "create_manual_activity", "get_activities", "get_activities_by_date",
-    "get_activity_types", "set_activity_description",
-    "set_activity_event_type", "set_activity_feel", "set_activity_name",
-    "set_activity_type", "set_perceived_effort",
+    "get_activity_exercise_sets", "get_activity_types",
+    "set_activity_description", "set_activity_event_type",
+    "set_activity_feel", "set_activity_name", "set_activity_type",
+    "set_perceived_effort",
     # challenges
     "get_personal_record", "get_race_predictions",
     # composites
@@ -158,8 +159,11 @@ _COACHING_PROFILE = frozenset({
     "get_progress_summary_between_dates", "get_respiration_trend",
     "get_training_load_balance", "get_training_load_trend",
     "get_training_status", "get_vo2max_trend", "request_reload",
+    # user_profile
+    "get_user_profile",
     # weight_management
     "add_weigh_in", "add_weigh_in_with_timestamps", "delete_weigh_ins",
+    "get_weigh_ins",
     # workout_builders
     "schedule_week",
     # workouts

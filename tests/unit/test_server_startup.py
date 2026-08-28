@@ -60,10 +60,13 @@ def test_default_start_registers_only_the_coaching_profile(monkeypatch):
 
 def test_all_restores_the_full_surface(monkeypatch):
     started = _start_server(monkeypatch, enabled="all")
+    full = set(started["tool_names"])
+    profile = set(garmin_mcp._COACHING_PROFILE)
 
-    assert started["tool_count"] > 2 * len(garmin_mcp._COACHING_PROFILE)
-    assert "get_devices" in started["tool_names"]
-    assert "get_workouts" in started["tool_names"]
+    assert profile < full                 # strict superset — nothing is removed
+    assert len(full - profile) >= 40      # ... and the profile is a real cut
+    assert "get_devices" in full
+    assert "get_workouts" in full
 
 
 def test_every_coaching_profile_name_is_a_real_tool(monkeypatch):
