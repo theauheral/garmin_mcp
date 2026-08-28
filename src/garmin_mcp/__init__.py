@@ -96,19 +96,118 @@ is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
 
 
 # --- Tool filtering ---------------------------------------------------------
-# Optionally expose only a subset of tools, to reduce the context an LLM must
-# carry. No modules are removed; tools are simply not registered when filtered.
-#   GARMIN_ENABLED_TOOLS  - comma-separated allowlist; if set, ONLY these register
-#   GARMIN_DISABLED_TOOLS - comma-separated denylist; ignored if an allowlist is set
-# Tool names are case-insensitive. Unset = all tools register (default behaviour).
+# This server registers 148 tools. Every tool schema is loaded into the
+# consuming model's context on EVERY turn, so the full surface is a permanent
+# tax on context, latency and cost — and on accuracy, since near-duplicate
+# tools invite mis-selection. Tools are therefore filtered by name at
+# registration time; no module is removed, the tool simply never reaches the
+# model.
+#   GARMIN_ENABLED_TOOLS  - comma-separated allowlist; if set, ONLY these register.
+#                           Accepts profile names (see _PROFILES) and the
+#                           special value "all" for the full 148-tool surface.
+#                           Unset = the "coaching" profile (the default).
+#   GARMIN_DISABLED_TOOLS - comma-separated denylist; ignored if an allowlist
+#                           is in effect (which, by default, it is — pass
+#                           GARMIN_ENABLED_TOOLS=all to use a denylist).
+# Names are case-insensitive; names matching no real tool warn on stderr.
 def _parse_tool_set(value):
     if not value:
         return set()
     return {name.strip().lower() for name in value.split(",") if name.strip()}
 
 
-enabled_tools = _parse_tool_set(os.getenv("GARMIN_ENABLED_TOOLS"))
-disabled_tools = _parse_tool_set(os.getenv("GARMIN_DISABLED_TOOLS"))
+# Every tool named by the garmin-wellness skill
+# (github.com/theauheral/garmin-cowork-plugin, skills/garmin-wellness/SKILL.md).
+# Mechanically derived from that file, not hand-picked: the skill routes reads
+# through the composites and writes through the workout/logging tools, and its
+# guardrail section names each destructive tool it writes a rule for — a rule
+# for a tool that isn't registered would be a rule about nothing. Regenerate
+# with the plugin repo's scripts/derive-coaching-profile.py when SKILL.md moves.
+_COACHING_PROFILE = frozenset({
+    # activity_analysis
+    "get_activity_fit_data",
+    # activity_management
+    "create_manual_activity", "get_activities", "get_activities_by_date",
+    "get_activity_types", "set_activity_description",
+    "set_activity_event_type", "set_activity_feel", "set_activity_name",
+    "set_activity_type", "set_perceived_effort",
+    # challenges
+    "get_personal_record", "get_race_predictions",
+    # composites
+    "get_coach_report", "get_energy_curve", "get_execution_trend",
+    "get_health_flags", "get_plan_context", "get_running_dynamics",
+    "get_session_analysis", "get_training_week", "get_wellness_brief",
+    "get_wins",
+    # courses
+    "delete_course",
+    # data_management
+    "add_body_composition", "add_hydration_data", "set_blood_pressure",
+    # gear_management
+    "remove_gear_from_activity",
+    # health_wellness
+    "get_all_day_stress", "get_body_battery", "get_daily_steps",
+    "get_heart_rates", "get_heart_rates_summary", "get_sleep_data",
+    "get_sleep_summary", "get_stats", "get_stress_summary",
+    "get_training_readiness", "get_weekly_intensity_minutes",
+    # nutrition
+    "create_custom_food", "delete_custom_food", "delete_food_log",
+    "log_custom_food", "log_food", "set_nutrition_daily_settings",
+    "update_custom_food", "upsert_and_log",
+    # training
+    "get_endurance_score", "get_hrv_data", "get_hrv_trend",
+    "get_progress_summary_between_dates", "get_respiration_trend",
+    "get_training_load_balance", "get_training_load_trend",
+    "get_training_status", "get_vo2max_trend", "request_reload",
+    # weight_management
+    "add_weigh_in", "add_weigh_in_with_timestamps", "delete_weigh_ins",
+    # workout_builders
+    "schedule_week",
+    # workouts
+    "delete_workout", "delete_workouts", "get_scheduled_workouts",
+    "get_workout_by_id", "get_workouts", "schedule_workout",
+    "schedule_workouts", "unschedule_workout", "unschedule_workouts",
+    "upload_workout", "upload_workouts",
+})
+
+_PROFILES = {"coaching": _COACHING_PROFILE}
+_DEFAULT_PROFILE = "coaching"
+_ALL_TOOLS = "all"
+
+
+def _resolve_enabled_tools(raw):
+    """Expand GARMIN_ENABLED_TOOLS into the allowlist actually applied.
+
+    Returns (allowlist, description). An empty allowlist means "register
+    everything"; description is what gets reported on stderr at startup so the
+    active filter is never invisible.
+
+    Unset picks the default profile rather than the full surface: an unfiltered
+    session costs the model 148 tool schemas per turn, which is the wrong
+    default for the coaching agent this server exists to feed. "all" is the
+    documented escape hatch, and profile names compose with explicit tool names
+    ("coaching,get_devices").
+    """
+    names = _parse_tool_set(raw)
+    if not names:
+        return set(_PROFILES[_DEFAULT_PROFILE]), f"{_DEFAULT_PROFILE} profile (default)"
+    if _ALL_TOOLS in names:
+        return set(), "all tools (no filter)"
+    allowed, used_profiles = set(), []
+    for name in names:
+        if name in _PROFILES:
+            allowed |= _PROFILES[name]
+            used_profiles.append(name)
+        else:
+            allowed.add(name)
+    if used_profiles:
+        extra = len(names) - len(used_profiles)
+        desc = " + ".join(f"{p} profile" for p in sorted(used_profiles))
+        return allowed, desc + (f" + {extra} named tool(s)" if extra else "")
+    return allowed, "explicit allowlist"
+
+
+# Resolved in main() rather than at import, so the env vars are read at the
+# moment the server actually starts (matching the transport config below).
 
 
 _VALID_TRANSPORTS = ("stdio", "streamable-http", "sse")
@@ -420,11 +519,23 @@ def main():
     # Create the MCP app, wrapped so the env-var filter can drop tools.
     # host/port only matter for the HTTP transports; stdio ignores them.
     fastmcp = FastMCP("Garmin Connect v1.0", host=http_host, port=http_port)
+    enabled_tools, tool_filter_desc = _resolve_enabled_tools(
+        os.getenv("GARMIN_ENABLED_TOOLS")
+    )
+    disabled_tools = _parse_tool_set(os.getenv("GARMIN_DISABLED_TOOLS"))
     app = _ToolFilter(fastmcp, enabled_tools, disabled_tools)
     if enabled_tools:
-        print(f"Tool filter: allowlist of {len(enabled_tools)} tool(s).", file=sys.stderr)
+        # Name the escape hatch on every filtered start: a tool the user
+        # expected and cannot find must not look like a missing feature.
+        print(
+            f"Tool filter: {tool_filter_desc} — {len(enabled_tools)} tool(s). "
+            f"Set GARMIN_ENABLED_TOOLS=all for the full surface.",
+            file=sys.stderr,
+        )
     elif disabled_tools:
         print(f"Tool filter: denylist of {len(disabled_tools)} tool(s).", file=sys.stderr)
+    else:
+        print(f"Tool filter: {tool_filter_desc}.", file=sys.stderr)
 
     # Register tools from all modules
     app = activity_management.register_tools(app)
@@ -450,6 +561,9 @@ def main():
     # Warn about filter entries that matched no tool (most likely typos)
     unknown = app.unknown_filter_names()
     if unknown:
+        # Either a typo in the env var, or a profile entry that no longer
+        # matches a real tool after a version bump. Both are silent bugs
+        # otherwise: the tool just never appears.
         print(
             f"Tool filter: warning — name(s) not found and ignored: {', '.join(unknown)}",
             file=sys.stderr,
