@@ -14,11 +14,19 @@ from statistics import fmean
 # The garmin_client will be set by the main file
 garmin_client = None
 
+# Activity HR sample streams, memoised per (activity_id, sample budget) — see
+# _hr_stream. Cleared whenever the client is reconfigured.
+_STREAM_CACHE = {}
+
 
 def configure(client):
     """Configure the module with the Garmin client instance"""
     global garmin_client
     garmin_client = client
+    # Cached streams belong to whoever fetched them. Swapping the client
+    # (a different account, or a test's fake) must not serve the old one's
+    # samples under the same activity ids.
+    _STREAM_CACHE.clear()
 
 
 def _round(value, digits=1):
@@ -454,6 +462,10 @@ _HR_ZONES_PATH = "/biometric-service/heartRateZones"
 # decimation (measured: identical easy-share from 300 to 5000 samples on a
 # 49-minute run), so this is a bandwidth choice, not an accuracy one.
 _HR_STREAM_SAMPLES = 2000
+# The trend fetches a stream per session, so it pays the payload N times. Time
+# weighting makes the result invariant to decimation (identical easy-share from
+# 300 to 5000 samples on a 49-minute run), so the trend buys the cheap one.
+_HR_STREAM_SAMPLES_TREND = 500
 # A gap longer than this is an auto-pause or a dropout, not time spent in a
 # zone — counting it would credit whichever zone happened to precede it.
 _HR_GAP_CAP_S = 60
@@ -541,12 +553,29 @@ def _hr_zone_model(lthr=None, sport="DEFAULT"):
     return model, None
 
 
+# An activity's samples never change after upload, so a scheduled agent calling
+# get_execution_trend repeatedly re-downloads the same bytes. Memoise the stream
+# — never the recomputation, which depends on a zone model that does drift.
+_STREAM_CACHE_MAX = 64
+
+
 def _hr_stream(activity_id, max_samples=_HR_STREAM_SAMPLES):
     """(elapsed_seconds, bpm) samples for one activity, or (None, reason).
 
     maxpoly=0 drops the GPS polyline: this needs two columns of a 26-column
     payload and the track is the bulk of it.
     """
+    key = (activity_id, max_samples)
+    if key in _STREAM_CACHE:
+        return _STREAM_CACHE[key]
+    result = _fetch_hr_stream(activity_id, max_samples)
+    if len(_STREAM_CACHE) >= _STREAM_CACHE_MAX:
+        _STREAM_CACHE.pop(next(iter(_STREAM_CACHE)))
+    _STREAM_CACHE[key] = result
+    return result
+
+
+def _fetch_hr_stream(activity_id, max_samples):
     try:
         details = garmin_client.get_activity_details(
             activity_id, maxchart=max_samples, maxpoly=0
@@ -612,7 +641,8 @@ def _shares(secs):
     return total, round(100 * easy / total), round(100 * (total - easy) / total)
 
 
-def _recompute_hr_zones(activity_id, model, stored=None, samples=None):
+def _recompute_hr_zones(activity_id, model, stored=None, samples=None,
+                        max_samples=_HR_STREAM_SAMPLES):
     """Time-in-zone for one activity scored against `model`, never raising.
 
     Always answers: either the recomputed distribution, or an explicit
@@ -620,7 +650,7 @@ def _recompute_hr_zones(activity_id, model, stored=None, samples=None):
     without saying so would reintroduce the exact bug this replaces.
     """
     if samples is None:
-        samples, reason = _hr_stream(activity_id)
+        samples, reason = _hr_stream(activity_id, max_samples)
         if samples is None:
             return {"not_recomputable": reason}
     secs, below = _integrate_zones(samples, model["floors"])
@@ -658,18 +688,46 @@ def _recompute_hr_zones(activity_id, model, stored=None, samples=None):
     return _drop_none(out)
 
 
-def _stored_floors(stored):
+def _stored_floors(stored, boundary_key="low_bpm"):
     """The bands Garmin froze into the activity, from a _zone_distribution."""
     by_zone = (stored or {}).get("by_zone") if isinstance(stored, dict) else None
     if not isinstance(by_zone, dict):
         return None
     floors = []
     for n in range(1, 6):
-        low = (by_zone.get(f"z{n}") or {}).get("low_bpm")
+        low = (by_zone.get(f"z{n}") or {}).get(boundary_key)
         if not isinstance(low, (int, float)):
             return None
         floors.append(int(low))
     return floors
+
+
+def _stamp_history(stamps, current=None):
+    """Group per-session frozen bands into the distinct zone models they came
+    from, newest first.
+
+    A zone-model change is invisible in any single activity — the bands are
+    stamped at upload and look authoritative forever. Seen side by side across
+    a block they are obvious, and this is what turns "the numbers moved" into
+    "the model changed on this date, and these N sessions carry the old one".
+    `stamps` is [(date, floors)] in the order sessions were analysed.
+    """
+    groups = []
+    for date, floors in stamps:
+        if not floors:
+            continue
+        if groups and groups[-1]["bands"] == floors:
+            groups[-1]["sessions"] += 1
+            groups[-1]["oldest"] = date
+        else:
+            groups.append({"bands": list(floors), "sessions": 1,
+                           "newest": date, "oldest": date})
+    if len(groups) < 2 and current is None:
+        return None
+    for g in groups:
+        if current is not None:
+            g["matches_current_model"] = g["bands"] == list(current)
+    return groups or None
 
 
 def _verify_against_stored(samples, stored, applied_floors):
@@ -699,6 +757,50 @@ def _verify_against_stored(samples, stored, applied_floors):
         # change?" — it replaces eyeballing every zone's low_bpm by hand.
         "stored_bands_differ": frozen != list(applied_floors),
     })
+
+
+def _power_model_drift(activities):
+    """Have the POWER zone bands moved across the analysed window?
+
+    Garmin freezes powerTimeInZones at upload exactly as it freezes the HR
+    ones, and the skill leans on power as the heat-proof cross-check — so the
+    same silent rot applies, and there is no live power-zone configuration to
+    score against (the biometric-service endpoints that exist for HR return
+    404/405 for power). A drift check is therefore the available guard: sample
+    the oldest and newest session in the window, two calls regardless of N,
+    and say plainly whether the model moved under them.
+    """
+    ids = [a.get("activityId") for a in activities if isinstance(a, dict) and a.get("activityId")]
+    if len(ids) < 2:
+        return None
+    ends = []
+    for aid in (ids[0], ids[-1]):
+        try:
+            floors = _stored_floors(
+                _zone_distribution(
+                    garmin_client.get_activity_power_in_timezones(aid),
+                    boundary_key="low_w",
+                ),
+                boundary_key="low_w",
+            )
+        except Exception:
+            return None
+        if not floors:
+            return None
+        ends.append(floors)
+    newest, oldest = ends
+    return {
+        "bands_w": newest,
+        "stable_across_window": newest == oldest,
+        "note": (
+            "power zone bands unchanged across the analysed window — "
+            "power_easy_share_pct is comparable across these sessions"
+            if newest == oldest else
+            f"power zone bands CHANGED across the window (oldest {oldest}, "
+            "newest {newest}) — power_easy_share_pct is frozen per activity "
+            "just like HR, so do not compare or average across the join"
+        ).replace("{newest}", str(newest)),
+    }
 
 
 def _pacing(lap_rows):
@@ -1271,6 +1373,7 @@ def register_tools(app):
             model, model_error = _hr_zone_model(lthr or None)
 
         runs = []
+        stamps = []
         not_recomputable = {}
         buckets = {"easy": 0, "grey": 0, "hard": 0, "unknown": 0}
         for a in acts:
@@ -1293,12 +1396,16 @@ def register_tools(app):
             try:
                 z = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
                 row["easy_share_pct"] = z["easy_share_pct"] if z else None
+                # The bands this session was stamped with, for the drift report.
+                stamps.append((row["date"], _stored_floors(z)))
             except Exception:
                 pass
             # The graded share: recomputed when we can, stored otherwise, but
             # never a mix — a single basis is the whole point of the series.
             if model:
-                rec = _recompute_hr_zones(aid, model)
+                rec = _recompute_hr_zones(
+                    aid, model, max_samples=_HR_STREAM_SAMPLES_TREND
+                )
                 if "not_recomputable" in rec:
                     not_recomputable[str(aid)] = rec["not_recomputable"]
                     graded_share = None
@@ -1335,6 +1442,14 @@ def register_tools(app):
                 "floors_bpm": model.get("floors_bpm"),
             }),
             "not_recomputable": not_recomputable or None,
+            # A zone-model change is a step, invisible in any one activity.
+            # Listed here it names the date it happened and how many sessions
+            # still carry the old bands — the thing that silently broke this
+            # KPI before the recompute existed.
+            "zone_model_stamps": _stamp_history(
+                stamps, model["floors"] if model else None
+            ),
+            "power_model": _power_model_drift(acts),
             "monotony": _drop_none({
                 "distinct_distances": len(set(dists)) if dists else None,
                 "distance_range_km": [min(dists), max(dists)] if dists else None,

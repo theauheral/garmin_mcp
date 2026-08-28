@@ -859,3 +859,102 @@ async def test_execution_trend_falls_back_to_stored_zones_and_says_so(
     assert "NOT comparable" in data["easy_share_basis"]
     assert "zone_model" not in data
     mock_garmin_client.get_activity_details.assert_not_called()
+
+
+def power_zones(*floors):
+    return [
+        {"zoneNumber": n, "secsInZone": 100, "zoneLowBoundary": f}
+        for n, f in enumerate(floors, start=1)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_names_the_date_the_zone_model_changed(
+    app_with_composites, mock_garmin_client
+):
+    """The step change, made visible: which sessions still carry old bands."""
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-26 19:00", "distance": 7000},
+        {"activityId": 2, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-24 19:00", "distance": 7000},
+        {"activityId": 3, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-14 19:00", "distance": 7000},
+    ]
+    corrected = [
+        {"zoneNumber": n, "secsInZone": 100, "zoneLowBoundary": f}
+        for n, f in enumerate([110, 130, 150, 160, 168], start=1)
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.side_effect = (
+        lambda aid: corrected if aid in (1, 2) else FROZEN_ZONES
+    )
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145)
+    mock_garmin_client.get_activity_power_in_timezones.return_value = power_zones(
+        150, 200, 250, 300, 350
+    )
+
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 3})
+    stamps = json.loads(result[0][0].text)["zone_model_stamps"]
+
+    assert [s["sessions"] for s in stamps] == [2, 1]
+    assert stamps[0]["matches_current_model"] is True
+    assert stamps[0]["oldest"] == "2026-08-24"      # the model changed here
+    assert stamps[1]["bands"] == [99, 118, 139, 157, 178]
+    assert stamps[1]["matches_current_model"] is False
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_flags_power_bands_moving_under_the_window(
+    app_with_composites, mock_garmin_client
+):
+    """Power zones freeze at upload too, and there is no live power model to
+    score against — so drift across the window is the available guard."""
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-26 19:00", "distance": 7000},
+        {"activityId": 2, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-14 19:00", "distance": 7000},
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145)
+    mock_garmin_client.get_activity_power_in_timezones.side_effect = (
+        lambda aid: power_zones(160, 210, 260, 310, 360) if aid == 1
+        else power_zones(150, 200, 250, 300, 350)
+    )
+
+    power = json.loads(
+        (await app_with_composites.call_tool("get_execution_trend", {"count": 2}))[0][0].text
+    )["power_model"]
+
+    assert power["stable_across_window"] is False
+    assert power["bands_w"] == [160, 210, 260, 310, 360]
+    assert "CHANGED" in power["note"]
+    # O(1) in the window size: only the two ends are sampled.
+    assert mock_garmin_client.get_activity_power_in_timezones.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_says_when_the_power_model_held_still(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-26 19:00", "distance": 7000},
+        {"activityId": 2, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-14 19:00", "distance": 7000},
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145)
+    mock_garmin_client.get_activity_power_in_timezones.return_value = power_zones(
+        150, 200, 250, 300, 350
+    )
+
+    power = json.loads(
+        (await app_with_composites.call_tool("get_execution_trend", {"count": 2}))[0][0].text
+    )["power_model"]
+
+    assert power["stable_across_window"] is True
+    assert "comparable" in power["note"]
