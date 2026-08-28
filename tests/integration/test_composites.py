@@ -656,3 +656,206 @@ async def test_health_flags_unknown_when_unsynced(app_with_composites, mock_garm
     data = json.loads(result[0][0].text)
     assert data["severity"] == "unknown"
     assert "synced" in data["note"]
+
+
+# --- Recomputed time-in-zone -------------------------------------------------
+# Garmin stamps hrTimeInZones into an activity at upload and never revisits it,
+# so a zone-model correction leaves every older session scored against the old
+# bands. These cover recomputing from the raw HR stream against the live model.
+
+LIVE_ZONE_CONFIG = [{
+    "trainingMethod": "LACTATE_THRESHOLD",
+    "lactateThresholdHeartRateUsed": 170,
+    "zone1Floor": 110, "zone2Floor": 130, "zone3Floor": 150,
+    "zone4Floor": 160, "zone5Floor": 168,
+    "maxHeartRateUsed": 196,
+    "restingHeartRateUsed": 48,
+    "sport": "DEFAULT",
+}]
+
+# The stock %max bands frozen into a pre-correction activity: 145 bpm reads Z3
+# ("hard") under these and Z2 ("easy") under the live model above.
+FROZEN_ZONES = [
+    {"zoneNumber": 1, "secsInZone": 0, "zoneLowBoundary": 99},
+    {"zoneNumber": 2, "secsInZone": 0, "zoneLowBoundary": 118},
+    {"zoneNumber": 3, "secsInZone": 601, "zoneLowBoundary": 139},
+    {"zoneNumber": 4, "secsInZone": 0, "zoneLowBoundary": 157},
+    {"zoneNumber": 5, "secsInZone": 0, "zoneLowBoundary": 178},
+]
+
+
+def hr_stream_payload(bpm, seconds=600):
+    """An activity-details response holding a steady-HR sample stream."""
+    return {
+        "metricDescriptors": [
+            {"metricsIndex": 0, "key": "directHeartRate"},
+            {"metricsIndex": 1, "key": "sumElapsedDuration"},
+        ],
+        "activityDetailMetrics": [
+            {"metrics": [bpm, t]} for t in range(seconds + 1)
+        ],
+    }
+
+
+NO_HR_STREAM = {
+    "metricDescriptors": [{"metricsIndex": 0, "key": "directSpeed"}],
+    "activityDetailMetrics": [{"metrics": [2.5]}],
+}
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_recomputes_zones_against_the_live_model(
+    app_with_composites, mock_garmin_client
+):
+    """Same raw HR, opposite verdict — and both numbers stay visible."""
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145)
+
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
+    zones = json.loads(result[0][0].text)["hr_zones"]
+
+    assert zones["easy_share_pct"] == 0            # Garmin's frozen answer, untouched
+    recomputed = zones["recomputed"]
+    assert recomputed["easy_share_pct"] == 100     # ... and the corrected one
+    assert recomputed["by_zone"]["z2"]["low_bpm"] == 130
+    assert recomputed["applied"]["lthr"] == 170
+    assert recomputed["applied"]["lthr_source"] == "garmin_zone_config"
+    # Rescoring the same stream with the activity's own bands reproduces
+    # Garmin's number, which is what makes the corrected one trustworthy.
+    assert recomputed["verification"]["matches_stored"] is True
+    assert recomputed["verification"]["stored_bands_differ"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_recompute_names_the_applied_lthr_override(
+    app_with_composites, mock_garmin_client
+):
+    """A coaching plan's threshold can differ from Garmin's auto-detected one."""
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145)
+
+    result = await app_with_composites.call_tool(
+        "get_session_analysis", {"date": "2026-07-01", "lthr": 190}
+    )
+    applied = json.loads(result[0][0].text)["hr_zones"]["recomputed"]["applied"]
+
+    assert applied["lthr"] == 190
+    assert applied["lthr_configured"] == 170
+    assert applied["lthr_source"] == "caller_override"
+    assert applied["floors_bpm"]["z2"] == 145      # 130 * 190/170
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_says_when_zones_cannot_be_recomputed(
+    app_with_composites, mock_garmin_client
+):
+    """A manual entry has no stream; that must be said, not papered over."""
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = NO_HR_STREAM
+
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
+    zones = json.loads(result[0][0].text)["hr_zones"]
+
+    assert "no heart-rate stream" in zones["recomputed"]["not_recomputable"]
+    assert "easy_share_pct" not in zones["recomputed"]
+    assert zones["easy_share_pct"] == 0            # stored value still reported
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_reports_an_unreadable_zone_configuration(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.side_effect = RuntimeError("503")
+
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
+    zones = json.loads(result[0][0].text)["hr_zones"]
+
+    assert "zone configuration unavailable" in zones["recomputed"]["not_recomputable"]
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_scores_every_session_on_one_zone_model(
+    app_with_composites, mock_garmin_client
+):
+    """The KPI's whole point: a series spanning a zone-model change, made
+    comparable. Both runs held 145 bpm; only their frozen bands differ."""
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-26 19:00", "distance": 7000},
+        {"activityId": 2, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-14 19:00", "distance": 7000},
+    ]
+    # Activity 1 was uploaded under the corrected model, activity 2 under the old one.
+    corrected = [
+        {"zoneNumber": 1, "secsInZone": 0, "zoneLowBoundary": 110},
+        {"zoneNumber": 2, "secsInZone": 601, "zoneLowBoundary": 130},
+        {"zoneNumber": 3, "secsInZone": 0, "zoneLowBoundary": 150},
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.side_effect = (
+        lambda aid: corrected if aid == 1 else FROZEN_ZONES
+    )
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145)
+
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 2})
+    data = json.loads(result[0][0].text)
+
+    stored = [s["easy_share_pct"] for s in data["sessions"]]
+    assert stored == [100, 0]                      # the broken prefix + clean suffix
+    assert [s["easy_share_recomputed_pct"] for s in data["sessions"]] == [100, 100]
+    assert data["avg_easy_share_pct"] == 100       # not the meaningless 50
+    assert data["distribution"] == {"easy": 2, "grey": 0, "hard": 0, "unknown": 0}
+    assert "recomputed" in data["easy_share_basis"]
+    assert data["zone_model"]["lthr"] == 170
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_excludes_sessions_it_cannot_recompute(
+    app_with_composites, mock_garmin_client
+):
+    """A session that can't be rescored must not be averaged in on the old
+    basis — that is the mixing this replaces."""
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-26 19:00", "distance": 7000},
+        {"activityId": 2, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-14 19:00", "distance": 7000},
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.side_effect = (
+        lambda aid, **kw: hr_stream_payload(145) if aid == 1 else NO_HR_STREAM
+    )
+
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 2})
+    data = json.loads(result[0][0].text)
+
+    assert data["avg_easy_share_pct"] == 100       # from activity 1 alone
+    assert data["distribution"]["unknown"] == 1
+    assert "no heart-rate stream" in data["not_recomputable"]["2"]
+    assert data["sessions"][1]["execution"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_falls_back_to_stored_zones_and_says_so(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"},
+         "startTimeLocal": "2026-08-26 19:00", "distance": 7000},
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+
+    result = await app_with_composites.call_tool(
+        "get_execution_trend", {"count": 1, "recompute_zones": False}
+    )
+    data = json.loads(result[0][0].text)
+
+    assert data["avg_easy_share_pct"] == 0
+    assert "NOT comparable" in data["easy_share_basis"]
+    assert "zone_model" not in data
+    mock_garmin_client.get_activity_details.assert_not_called()
