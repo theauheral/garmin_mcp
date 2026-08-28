@@ -11,6 +11,7 @@ import pytest
 from garmin_mcp import composites
 from garmin_mcp.composites import (
     _hr_stream,
+    _stamp_history,
     _hr_zone_model,
     _integrate_zones,
     _recompute_hr_zones,
@@ -64,6 +65,12 @@ def details_payload(samples, hr_key="directHeartRate", time_key="sumElapsedDurat
         ],
         "activityDetailMetrics": [{"metrics": [hr, t]} for t, hr in samples],
     }
+
+
+NO_HR_DETAILS = {
+    "metricDescriptors": [{"metricsIndex": 0, "key": "directPower"}],
+    "activityDetailMetrics": [{"metrics": [220]}, {"metrics": [230]}],
+}
 
 
 def steady(bpm, seconds, step=1):
@@ -316,3 +323,72 @@ def test_recompute_says_when_no_time_lands_in_any_zone(client):
     out = _recompute_hr_zones(11, model)
 
     assert out["not_recomputable"] == "no heart-rate time inside any zone"
+
+
+# --- zone-model drift ---------------------------------------------------------
+
+
+def test_stamp_history_groups_sessions_by_the_model_they_carry():
+    """The step change a single activity cannot show."""
+    stamps = [
+        ("2026-08-26", LIVE_FLOORS),
+        ("2026-08-24", LIVE_FLOORS),
+        ("2026-08-14", FROZEN_FLOORS),
+        ("2026-07-31", FROZEN_FLOORS),
+        ("2026-07-20", FROZEN_FLOORS),
+    ]
+    groups = _stamp_history(stamps, current=LIVE_FLOORS)
+
+    assert [g["sessions"] for g in groups] == [2, 3]
+    assert groups[0]["bands"] == LIVE_FLOORS
+    assert groups[0]["newest"] == "2026-08-26" and groups[0]["oldest"] == "2026-08-24"
+    assert groups[0]["matches_current_model"] is True
+    assert groups[1]["oldest"] == "2026-07-20"      # the change landed on 08-24
+    assert groups[1]["matches_current_model"] is False
+
+
+def test_stamp_history_is_quiet_when_one_model_covers_everything():
+    """Nothing to report is worth nothing said — unless the one model in play
+    is not the current one, which is exactly worth saying."""
+    stamps = [("2026-08-26", LIVE_FLOORS), ("2026-08-24", LIVE_FLOORS)]
+
+    assert _stamp_history(stamps) is None
+    only = _stamp_history(stamps, current=FROZEN_FLOORS)
+    assert len(only) == 1 and only[0]["matches_current_model"] is False
+
+
+def test_stamp_history_skips_sessions_with_no_bands():
+    groups = _stamp_history([("2026-08-26", LIVE_FLOORS), ("2026-08-14", None)])
+
+    assert groups is None or len(groups) == 1
+
+
+# --- stream caching -----------------------------------------------------------
+
+
+def test_stream_is_fetched_once_per_activity(client):
+    """Samples never change after upload, so a repeat call must not re-download."""
+    c = client(details=details_payload(steady(145, 60)))
+    first, _ = _hr_stream(11)
+    second, _ = _hr_stream(11)
+
+    assert first == second
+    assert len(c.details_calls) == 1
+
+
+def test_reconfiguring_the_client_drops_cached_streams(client):
+    """A different client must never be served the previous one's samples."""
+    client(details=details_payload(steady(145, 60)))
+    _hr_stream(11)
+    c2 = client(details=details_payload(steady(100, 60)))
+    samples, _ = _hr_stream(11)
+
+    assert len(c2.details_calls) == 1
+    assert samples[0][1] == 100
+
+
+def test_a_failure_is_cached_too_rather_than_retried_per_session(client):
+    c = client(details=NO_HR_DETAILS)
+    assert _hr_stream(11)[0] is None
+    assert _hr_stream(11)[0] is None
+    assert len(c.details_calls) == 1
