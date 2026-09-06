@@ -445,8 +445,21 @@ When an HTTP transport is selected:
 
 - MCP clients connect to the **`/mcp`** path (e.g. `http://localhost:8000/mcp`).
 - A plain **`GET /healthz`** endpoint is exposed for liveness/readiness probes.
+- `streamable-http` is served **stateless**: no `Mcp-Session-Id` is issued, and
+  every request is self-contained, so any replica can serve any call.
 
-The server itself performs **no authentication** on the HTTP endpoint — put it behind a reverse proxy (nginx, Traefik, Authelia, etc.) if it is reachable beyond localhost.
+That last point matters more than it looks. In the session-based mode, the reply
+to `initialize` carries an `Mcp-Session-Id` bound to the process that issued it,
+and any later request arriving without it is rejected `400 Bad Request: Missing
+session ID`. Behind a load balancer or an MCP broker that does not guarantee
+session affinity — Anthropic's does not — the handshake succeeds and then every
+real call fails, which presents to the client as a server that is down rather
+than as a routing problem. Serving stateless removes the affinity requirement.
+Nothing is given up here: this server sends no server-initiated notifications,
+and the authenticated Garmin client is process-global, established before the
+first request rather than per session.
+
+The server itself performs **no authentication** on the HTTP endpoint — put it behind a reverse proxy (nginx, Traefik, Authelia, etc.) if it is reachable beyond localhost. This is not a formality once the transport is HTTP: the default tool profile includes writes and deletes against the account whose tokens the process holds.
 
 ### Garmin Connect China (garmin.cn)
 

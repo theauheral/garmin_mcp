@@ -216,6 +216,12 @@ def _resolve_enabled_tools(raw):
 
 _VALID_TRANSPORTS = ("stdio", "streamable-http", "sse")
 
+# The streamable-HTTP mount path. This is also FastMCP's default, but it is
+# named here because remote clients hard-code the full URL (".../mcp") in their
+# config: a change to the library default would silently break every one of
+# them, and a constant makes the contract greppable from both ends.
+_STREAMABLE_HTTP_PATH = "/mcp"
+
 
 class _GarminProxy:
     """Wraps the Garmin client to translate known runtime exceptions into clear messages.
@@ -481,7 +487,8 @@ def main():
 
     # --- Transport configuration --------------------------------------------
     # By default the server speaks stdio (Claude Desktop, MCP Inspector, etc.).
-    # Set GARMIN_MCP_TRANSPORT=streamable-http (or sse) to serve over HTTP.
+    # Set GARMIN_MCP_TRANSPORT=streamable-http to serve over HTTP, which is
+    # what any remote deployment wants; it is served stateless at /mcp.
     #   GARMIN_MCP_TRANSPORT - stdio (default) | streamable-http | sse
     #   GARMIN_MCP_HOST      - bind address for HTTP transports (default 127.0.0.1)
     #   GARMIN_MCP_PORT      - bind port for HTTP transports (default 8000)
@@ -521,8 +528,28 @@ def main():
     composites.configure(garmin_client)
 
     # Create the MCP app, wrapped so the env-var filter can drop tools.
-    # host/port only matter for the HTTP transports; stdio ignores them.
-    fastmcp = FastMCP("Garmin Connect v1.0", host=http_host, port=http_port)
+    # host/port/path only matter for the HTTP transports; stdio ignores them.
+    #
+    # stateless_http=True is not a tuning knob — it is what makes this server
+    # survivable behind a load balancer. In the session-based mode, the reply
+    # to `initialize` carries an Mcp-Session-Id bound to the process that
+    # issued it, and every later request without it is rejected
+    # `400 Bad Request: Missing session ID`. Anthropic's broker gives no
+    # session-affinity guarantee, so a stateful server behind it handshakes
+    # and then fails every real call — a failure that reads, from the client
+    # side, as "the server is down" rather than as a routing problem. Stateless
+    # makes each request self-contained, so any worker can serve any call.
+    # Nothing is given up: the session would hold no state this server uses.
+    # It pushes no server-initiated notifications, and the one piece of
+    # genuinely long-lived state — the authenticated Garmin client — is
+    # process-global and set up before the first request, not per session.
+    fastmcp = FastMCP(
+        "Garmin Connect v1.0",
+        host=http_host,
+        port=http_port,
+        streamable_http_path=_STREAMABLE_HTTP_PATH,
+        stateless_http=True,
+    )
     enabled_tools, tool_filter_desc = _resolve_enabled_tools(
         os.getenv("GARMIN_ENABLED_TOOLS")
     )
@@ -583,8 +610,14 @@ def main():
         async def healthz(_request: "Request") -> "PlainTextResponse":
             return PlainTextResponse("ok")
 
+        where = (
+            f"http://{http_host}:{http_port}{_STREAMABLE_HTTP_PATH}"
+            if transport == "streamable-http"
+            else f"{http_host}:{http_port}"
+        )
+        mode = "stateless" if transport == "streamable-http" else "session-based"
         print(
-            f"Serving MCP over {transport} on {http_host}:{http_port}",
+            f"Serving MCP over {transport} ({mode}) at {where}",
             file=sys.stderr,
         )
 
