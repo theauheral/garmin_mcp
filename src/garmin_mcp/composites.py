@@ -1170,7 +1170,7 @@ def register_tools(app):
         re-integrates time-in-zone from the raw HR sample stream against the
         CURRENT zone model, so easy-share is comparable across a zone-model
         change; read it in preference to the stored share, and use
-        `recomputed.stored_bands_differ` to tell whether this activity was
+        `recomputed.verification.stored_bands_differ` to tell whether this activity was
         affected at all. `recomputed.applied.lthr` names the threshold actually
         used, and `recomputed.verification` re-scores the same stream with the
         activity's own frozen bands — when it reproduces the stored share, the
