@@ -392,6 +392,36 @@ class _ThreadFilteredStream:
         return getattr(self._real_stream, name)
 
 
+class _ThreadMutedStream:
+    """Wraps a stream so ``muted_thread``'s writes are discarded and every
+    other thread's writes pass through untouched.
+
+    The mirror image of ``_ThreadFilteredStream``, for ``init_api()``: it
+    silences the Garmin library's stderr noise while tokens are validated,
+    and since issue #255 it runs on the background login thread. ``sys.stderr``
+    is process-wide, so the plain ``StringIO`` swap it used to install also
+    swallowed whatever the main thread reported in that window -- which is
+    precisely when ``main()`` prints the active tool filter, the unknown-name
+    warning and the HTTP "Serving MCP over ..." line. Muting by thread keeps
+    the silence on the login thread and nowhere else.
+    """
+
+    def __init__(self, real_stream, muted_thread):
+        self._real_stream = real_stream
+        self._muted_thread = muted_thread
+
+    def write(self, data):
+        if threading.current_thread() is self._muted_thread:
+            return len(data)
+        return self._real_stream.write(data)
+
+    def flush(self):
+        self._real_stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real_stream, name)
+
+
 class _PendingGarminClient:
     """Stands in for the real Garmin client until a background login finishes.
 
@@ -519,7 +549,6 @@ class _ToolFilter:
 
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
-    import io
 
     # Claude Desktop may leave blank optional user_config values as literal
     # placeholders. Do not mistake those strings for credentials and trigger a
@@ -542,15 +571,19 @@ def init_api(email, password):
         # with open(dir_path, "r") as token_file:
         #     tokenstore = token_file.read()
 
-        # Suppress stderr during token validation to hide noisy library
-        # warnings. stdout is deliberately NOT swapped here: by the time
-        # init_api() runs, sys.stdout is a _ThreadFilteredStream installed
-        # in main() before this call's background thread was started, which
-        # already discards any stray write from this thread on its own. A
-        # second swap here would instead risk swallowing real MCP protocol
-        # output written concurrently by the server's own thread (#255).
+        # Mute stderr during token validation to hide noisy library warnings
+        # -- this thread's stderr only. init_api() runs on the background
+        # login thread (#255) and sys.stderr is process-wide, so a plain
+        # StringIO swap here would also swallow what the main thread reports
+        # meanwhile: the tool-filter line, for one. stdout is deliberately
+        # NOT swapped here: by the time init_api() runs, sys.stdout is a
+        # _ThreadFilteredStream installed in main() before this call's
+        # background thread was started, which already discards any stray
+        # write from this thread on its own. A second swap here would instead
+        # risk swallowing real MCP protocol output written concurrently by
+        # the server's own thread.
         old_stderr = sys.stderr
-        sys.stderr = io.StringIO()
+        sys.stderr = _ThreadMutedStream(old_stderr, threading.current_thread())
 
         try:
             garmin = Garmin(is_cn=is_cn)
