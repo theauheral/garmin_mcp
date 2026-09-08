@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from garmin_mcp import _ThreadFilteredStream
+from garmin_mcp import _ThreadFilteredStream, _ThreadMutedStream
 
 
 class TestThreadFilteredStream:
@@ -92,3 +92,74 @@ class TestPendingGarminClient:
         proxy = _GarminProxy(pending)
 
         assert proxy.get_steps_data() == [1, 2, 3]
+
+
+class TestThreadMutedStream:
+    """Tests for _ThreadMutedStream, the stderr mute init_api() installs."""
+
+    def test_muted_thread_write_is_swallowed(self):
+        written = []
+        real_stream = type("Fake", (), {"write": lambda self, s: written.append(s)})()
+        stream = _ThreadMutedStream(real_stream, threading.current_thread())
+
+        result = stream.write("library noise\n")
+
+        assert written == []
+        assert result == len("library noise\n")
+
+    def test_other_thread_write_passes_through(self):
+        written = []
+        real_stream = type("Fake", (), {"write": lambda self, s: written.append(s)})()
+        other_thread = threading.Thread(target=lambda: None)
+        stream = _ThreadMutedStream(real_stream, other_thread)
+
+        stream.write("Tool filter: coaching profile\n")
+
+        assert written == ["Tool filter: coaching profile\n"]
+
+    def test_unknown_attribute_delegates_to_real_stream(self):
+        real_stream = type("Fake", (), {"encoding": "utf-8"})()
+        stream = _ThreadMutedStream(real_stream, threading.current_thread())
+
+        assert stream.encoding == "utf-8"
+
+
+def test_init_api_mutes_only_the_login_thread(monkeypatch, capsys):
+    """The stderr mute around token validation must not swallow what the main
+    thread reports meanwhile. init_api() runs on the background login thread
+    (#255), and the tool-filter line main() prints in exactly that window is
+    what the consuming plugin's smoke test greps stderr for -- with a
+    process-wide StringIO swap it vanished while the profile itself was
+    correctly active."""
+    import sys
+
+    import garmin_mcp
+
+    in_login = threading.Event()
+    release = threading.Event()
+
+    class FakeGarmin:
+        def __init__(self, **_kwargs):
+            pass
+
+        def login(self, _tokenstore):
+            print("library noise", file=sys.stderr)
+            in_login.set()
+            assert release.wait(5), "test never released the fake login"
+
+    monkeypatch.setattr(garmin_mcp, "Garmin", FakeGarmin)
+    outcome = {}
+    login = threading.Thread(
+        target=lambda: outcome.setdefault("client", garmin_mcp.init_api(None, None))
+    )
+    login.start()
+    assert in_login.wait(5), "fake login never started"
+    print("Tool filter: coaching profile (default)", file=sys.stderr)
+    release.set()
+    login.join(5)
+
+    err = capsys.readouterr().err
+    assert "Tool filter: coaching profile (default)" in err
+    assert "library noise" not in err
+    assert isinstance(outcome["client"], FakeGarmin)
+    assert not isinstance(sys.stderr, garmin_mcp._ThreadMutedStream)  # restored
