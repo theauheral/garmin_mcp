@@ -7,6 +7,16 @@ from datetime import datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 
 
+@pytest.fixture(autouse=True)
+def _no_exercise_catalog_fetch(monkeypatch):
+    """Upload validation fetches Garmin's public exercise catalogs over the
+    network. Tests never do: unreachable means validation is skipped, and the
+    tests that exercise it install a small catalog of their own."""
+    from garmin_mcp import workouts
+    monkeypatch.setattr(workouts, "_EXERCISE_CATALOG", None)
+    monkeypatch.setattr(workouts, "_fetch_exercise_catalog", lambda: None)
+
+
 @pytest.fixture
 def mock_garmin_client():
     """Create a mock Garmin client with common methods stubbed"""
