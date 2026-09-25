@@ -17,6 +17,9 @@ from garmin_mcp.composites import (
     _recompute_hr_zones,
     _shares,
     _zone_model_from_config,
+    _zone_sport,
+    _floors_basis,
+    _lthr_floors,
 )
 
 # Garmin's live zone-config payload, %LTHR anchored (the corrected model).
@@ -24,15 +27,27 @@ ZONE_CONFIG = [{
     "trainingMethod": "LACTATE_THRESHOLD",
     "restingHeartRateUsed": 48,
     "lactateThresholdHeartRateUsed": 170,
-    "zone1Floor": 110, "zone2Floor": 130, "zone3Floor": 150,
+    "zone1Floor": 110, "zone2Floor": 134, "zone3Floor": 150,
     "zone4Floor": 160, "zone5Floor": 168,
     "maxHeartRateUsed": 196,
     "sport": "DEFAULT",
 }]
 
+# What Garmin served on 2026-09-25: labelled LACTATE_THRESHOLD, floors built
+# on 50/60/70/80/90% of a 188 max HR.
+MISLABELLED_CONFIG = {
+    "trainingMethod": "LACTATE_THRESHOLD",
+    "restingHeartRateUsed": 47,
+    "lactateThresholdHeartRateUsed": 172,
+    "maxHeartRateUsed": 188,
+    "zone1Floor": 94, "zone2Floor": 113, "zone3Floor": 132,
+    "zone4Floor": 150, "zone5Floor": 169,
+    "sport": "DEFAULT",
+}
+
 # The stock %max bands an older activity carries frozen into it.
 FROZEN_FLOORS = [99, 118, 139, 157, 178]
-LIVE_FLOORS = [110, 130, 150, 160, 168]
+LIVE_FLOORS = [110, 134, 150, 160, 168]
 
 
 class FakeClient:
@@ -111,8 +126,36 @@ def test_zone_model_picks_the_requested_sport():
     assert _zone_model_from_config(entries, "DEFAULT")["floors"] == LIVE_FLOORS
 
 
-def test_zone_model_falls_back_to_the_first_entry_when_sport_is_absent():
-    assert _zone_model_from_config(ZONE_CONFIG, "TRIATHLON")["floors"] == LIVE_FLOORS
+def test_zone_model_falls_back_to_default_when_sport_is_absent():
+    entries = [
+        {"sport": "CYCLING", "zone1Floor": 1, "zone2Floor": 2, "zone3Floor": 3,
+         "zone4Floor": 4, "zone5Floor": 5},
+        ZONE_CONFIG[0],
+    ]
+    model = _zone_model_from_config(entries, "RUNNING")
+    assert model["floors"] == LIVE_FLOORS  # DEFAULT, not the first entry
+    assert model["sport"] == "DEFAULT"
+
+
+def test_zone_model_prefers_a_sport_specific_set(client):
+    running = {**ZONE_CONFIG[0], "sport": "RUNNING", "zone3Floor": 155}
+    client(zones=[ZONE_CONFIG[0], running])
+    model, _ = _hr_zone_model(sport="RUNNING")
+    assert model["floors"][2] == 155
+    assert "sport_note" not in model
+
+    model, _ = _hr_zone_model(sport="CYCLING")
+    assert model["sport"] == "DEFAULT"
+    assert "no CYCLING zone set" in model["sport_note"]
+
+
+@pytest.mark.parametrize("type_key,sport", [
+    ("running", "RUNNING"), ("trail_running", "RUNNING"), ("treadmill_running", "RUNNING"),
+    ("cycling", "CYCLING"), ("road_biking", "CYCLING"), ("strength_training", "DEFAULT"),
+    (None, "DEFAULT"),
+])
+def test_zone_sport_maps_activity_types(type_key, sport):
+    assert _zone_sport(type_key) == sport
 
 
 def test_zone_model_rejects_a_payload_missing_a_floor():
@@ -121,27 +164,64 @@ def test_zone_model_rejects_a_payload_missing_a_floor():
     assert _zone_model_from_config("nonsense") is None
 
 
-def test_lthr_override_rescales_every_boundary(client):
+def test_lthr_override_builds_bands_from_garmins_lthr_ratios(client):
     """The two sources disagree in practice; ~5 bpm moves every boundary."""
     client()
     model, error = _hr_zone_model(lthr=175)
 
     assert error is None
-    # 110 * 175/170 = 113.2, 150 * 175/170 = 154.4 ...
-    assert model["floors"] == [113, 134, 154, 165, 173]
+    # 175 x (0.65, 0.79, 0.88, 0.94, 0.99)
+    assert model["floors"] == [114, 138, 154, 164, 173]
     assert model["lthr"] == 175
     assert model["lthr_configured"] == 170
     assert model["lthr_source"] == "caller_override"
+    assert model["floors_basis"] == "pct_lthr"
 
 
-def test_lthr_override_without_a_configured_threshold_says_so(client):
-    client(zones=[{**ZONE_CONFIG[0], "lactateThresholdHeartRateUsed": None,
-                   "trainingMethod": "PERCENT_MAX"}])
-    model, _ = _hr_zone_model(lthr=175)
+def test_lthr_ratios_reproduce_garmins_live_floors():
+    """Measured 2026-08-28: live %LTHR floors at two auto-detected LTHRs."""
+    assert _lthr_floors(173) == [112, 137, 152, 163, 171]
+    assert _lthr_floors(171) == [111, 135, 150, 161, 169]
 
-    assert model["floors"] == LIVE_FLOORS  # unchanged, not silently rescaled
-    assert "lthr_override_ignored" in model
-    assert model["lthr_source"] == "garmin_zone_config"
+
+def test_lthr_override_works_on_a_max_hr_config(client):
+    """Rescaling a %max config by an LTHR ratio would be meaningless; the
+    override builds %LTHR bands instead, whatever the config's basis."""
+    client(zones=[MISLABELLED_CONFIG])
+    model, _ = _hr_zone_model(lthr=172)
+
+    assert model["floors"] == [112, 136, 151, 162, 170]
+    assert model["lthr_source"] == "caller_override"
+    assert "method_mismatch" not in model
+
+
+def test_a_mislabelled_config_is_named(client):
+    """Live 2026-09-25: LACTATE_THRESHOLD label, floors = 50-90% of max 188.
+    Scored on those, a 145 bpm easy run reads as zone 3."""
+    client(zones=[MISLABELLED_CONFIG])
+    model, _ = _hr_zone_model()
+
+    assert model["floors"] == [94, 113, 132, 150, 169]
+    assert model["floors_basis"] == "pct_max_hr"
+    assert "LACTATE_THRESHOLD" in model["method_mismatch"]
+    assert "max HR 188" in model["method_mismatch"]
+
+
+def test_a_consistent_config_raises_no_mismatch(client):
+    client()
+    model, _ = _hr_zone_model()
+    assert model["floors_basis"] == "pct_lthr"
+    assert "method_mismatch" not in model
+
+
+@pytest.mark.parametrize("floors,basis", [
+    ([110, 134, 150, 160, 168], "pct_lthr"),
+    ([94, 113, 132, 150, 169], "pct_max_hr"),
+    ([118, 132, 146, 160, 174], "pct_hrr"),   # rest 48, max 188
+    ([100, 120, 140, 150, 160], "custom"),
+])
+def test_floors_basis_recognises_each_anchor(floors, basis):
+    assert _floors_basis(floors, lthr=170, max_hr=188, resting_hr=48) == basis
 
 
 def test_zone_config_failure_returns_a_reason(client):
@@ -238,7 +318,7 @@ def test_shares_of_an_empty_distribution():
 def test_recompute_matches_a_hand_calculation(client):
     """600 s at a steady 145 bpm, scored against the live model.
 
-    145 sits above the Z2 floor (130) and below Z3 (150), so the whole session
+    145 sits above the Z2 floor (134) and below Z3 (150), so the whole session
     is easy: 10 minutes in Z2 and nothing anywhere else.
     """
     client(details=details_payload(steady(145, 600)))
@@ -249,7 +329,7 @@ def test_recompute_matches_a_hand_calculation(client):
     assert out["hard_share_pct"] == 0
     assert out["total_min"] == 10.0
     assert out["by_zone"]["z2"]["min"] == 10.0
-    assert out["by_zone"]["z2"]["low_bpm"] == 130
+    assert out["by_zone"]["z2"]["low_bpm"] == 134
     assert out["by_zone"]["z3"]["min"] == 0.0
     assert out["samples"] == 601
     assert out["applied"]["lthr"] == 170
@@ -387,8 +467,15 @@ def test_reconfiguring_the_client_drops_cached_streams(client):
     assert samples[0][1] == 100
 
 
-def test_a_failure_is_cached_too_rather_than_retried_per_session(client):
-    c = client(details=NO_HR_DETAILS)
+def test_a_failure_is_not_cached(client):
+    """A timeout or a 429 is transient: remembering it would make the
+    activity unrecomputable until the server restarts."""
+    c = client(details_error=TimeoutError("stalled"))
     assert _hr_stream(11)[0] is None
-    assert _hr_stream(11)[0] is None
-    assert len(c.details_calls) == 1
+    c._details_error = None
+    c._details = details_payload([(0, 120), (1, 121)])
+    samples, error = _hr_stream(11)
+    assert error is None and samples == [(0, 120), (1, 121)]
+    assert len(c.details_calls) == 2
+    _hr_stream(11)
+    assert len(c.details_calls) == 2  # the success is cached
