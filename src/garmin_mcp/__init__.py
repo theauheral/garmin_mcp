@@ -144,15 +144,16 @@ _COACHING_PROFILE = frozenset({
     # health_wellness
     "get_all_day_stress", "get_body_battery", "get_daily_steps",
     "get_heart_rates", "get_heart_rates_summary", "get_sleep_data",
-    "get_sleep_summary", "get_stats", "get_stress_summary",
-    "get_training_readiness", "get_weekly_intensity_minutes",
+    "get_sleep_summary", "get_stats", "get_stats_range",
+    "get_stress_summary", "get_training_readiness",
+    "get_weekly_intensity_minutes",
     # training
     "get_endurance_score", "get_hrv_data", "get_hrv_trend",
     "get_progress_summary_between_dates", "get_respiration_trend",
     "get_training_load_balance", "get_training_load_trend",
     "get_training_status", "get_vo2max_trend", "request_reload",
     # user_profile
-    "get_user_profile",
+    "get_user_profile", "set_heart_rate_zones",
     # weight_management
     "add_weigh_in", "get_weigh_ins",
     # workouts
