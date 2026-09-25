@@ -366,6 +366,116 @@ def _validate_target_type_steps(workout_data: dict) -> None:
             _validate_target_type_step(step, path)
 
 
+# Garmin's public exercise catalogs. Together they are one namespace: Garmin's
+# own strength workouts use keys from all four (CORE/CAT_COW from Mobility,
+# MOVE/PLANK_UP_DOWNS from Yoga). A category/exerciseName pair outside them is
+# accepted by the upload and then silently blanked, which costs the step its
+# exercise name, rep counting and video on the watch.
+_EXERCISE_CATALOG_URLS = tuple(
+    f"https://connect.garmin.com/web-data/exercises/{name}.json"
+    for name in ("Exercises", "Yoga", "Pilates", "Mobility")
+)
+_EXERCISE_CATALOG = None
+# Sports whose work steps are exercises and must carry a key.
+_EXERCISE_SPORTS = {"strength_training", "yoga", "pilates", "mobility", "hiit"}
+_REST_STEP_KEYS = {"rest", "recovery"}
+
+
+def _fetch_exercise_catalog():
+    """{category: set(exerciseName)} over the four catalogs, or None when any
+    is unreachable — validation is then skipped, never a blocked upload.
+
+    requests, not urllib: Garmin's CDN answers urllib's default client with 403.
+    """
+    import requests
+
+    catalog = {}
+    for url in _EXERCISE_CATALOG_URLS:
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return None
+        for category, body in ((data or {}).get("categories") or {}).items():
+            catalog.setdefault(category, set()).update(((body or {}).get("exercises") or {}).keys())
+    return catalog or None
+
+
+def _exercise_catalog():
+    """The catalog, fetched once per process (a failure is retried next call)."""
+    global _EXERCISE_CATALOG
+    if _EXERCISE_CATALOG is None:
+        _EXERCISE_CATALOG = _fetch_exercise_catalog()
+    return _EXERCISE_CATALOG
+
+
+def _exercise_key_problem(category, name, catalog, needs_key):
+    """Why a step's exercise key would be blanked by Garmin, or None."""
+    import difflib
+
+    if not category and not name:
+        return "no category/exerciseName — the watch shows no exercise and no video" if needs_key else None
+    if not category or not name:
+        return f"category={category!r} exerciseName={name!r}: both are required together"
+    homes = sorted(c for c, names in catalog.items() if name in names)
+    if category not in catalog:
+        near = difflib.get_close_matches(category, list(catalog), n=3)
+        return (f"unknown category {category}"
+                + (f" (did you mean {', '.join(near)}?)" if near else "")
+                + (f"; {name} lives under {', '.join(homes)}" if homes else ""))
+    if name not in catalog[category]:
+        near = difflib.get_close_matches(name, list(catalog[category]), n=3, cutoff=0.5)
+        parts = []
+        if homes:
+            parts.append(f"{name} exists under {', '.join(homes)}")
+        if near:
+            parts.append(f"nearest in {category}: {', '.join(near)}")
+        return f"{category}/{name} is not in Garmin's catalog" + (f" ({'; '.join(parts)})" if parts else "")
+    return None
+
+
+def _validate_exercise_keys(workout_data: dict) -> None:
+    """Reject exercise keys Garmin would blank on upload, with suggestions.
+
+    Every non-rest step of an exercise sport (strength, yoga, pilates,
+    mobility, HIIT) must carry a catalog key; in other sports a key is checked
+    only where one is given. Skipped when the catalogs are unreachable.
+    """
+    catalog = _exercise_catalog()
+    if not catalog:
+        return
+    sport = ((workout_data.get("sportType") or {}).get("sportTypeKey") or "").lower()
+    problems = []
+
+    def walk(steps, path, seg_sport):
+        for index, step in enumerate(steps or []):
+            here = f"{path}[{index}]"
+            if step.get("type") == "RepeatGroupDTO" or step.get("workoutSteps"):
+                walk(step.get("workoutSteps"), f"{here}.workoutSteps", seg_sport)
+                continue
+            step_type = ((step.get("stepType") or {}).get("stepTypeKey") or "").lower()
+            if step_type in _REST_STEP_KEYS:
+                continue
+            problem = _exercise_key_problem(
+                step.get("category"), step.get("exerciseName"), catalog,
+                needs_key=seg_sport in _EXERCISE_SPORTS,
+            )
+            if problem:
+                problems.append(f"{here}: {problem}")
+
+    for seg_index, segment in enumerate(workout_data.get("workoutSegments") or []):
+        seg_sport = ((segment.get("sportType") or {}).get("sportTypeKey") or sport).lower()
+        walk(segment.get("workoutSteps"), f"workoutSegments[{seg_index}].workoutSteps", seg_sport)
+    if problems:
+        raise ValueError(
+            "Exercise keys Garmin would silently blank (no name, rep count or video "
+            "on the watch). Use a category/exerciseName pair from "
+            "https://connect.garmin.com/web-data/exercises/{Exercises,Yoga,Pilates,Mobility}.json"
+            " — the nearest real key beats a blank one:\n  " + "\n  ".join(problems)
+        )
+
+
 def _curate_workout_summary(workout: dict) -> dict:
     """Extract essential workout metadata for list views"""
     sport_type = workout.get('sportType') or {}
@@ -582,6 +692,12 @@ def _curate_workout_step(step: dict) -> dict:
         weight_unit = step.get('weightUnit', {})
         if weight_unit and weight_unit.get('unitKey'):
             curated['weight_unit'] = weight_unit.get('unitKey')
+    # Garmin's own strength workouts load by feel (BODY_WEIGHT/LIGHT/
+    # MODERATE/HEAVY) and mark one-sided moves LEFT/RIGHT/ALTERNATING.
+    if step.get('relativeWeight'):
+        curated['relative_weight'] = step.get('relativeWeight')
+    if step.get('exerciseSide'):
+        curated['exercise_side'] = step.get('exerciseSide')
 
     # Repeat info for repeat steps
     if step.get('type') == 'RepeatGroupDTO':
@@ -1075,6 +1191,7 @@ def register_tools(app):
             _normalize_workout_steps(workout_data)
             _validate_end_condition_steps(workout_data)
             _validate_target_type_steps(workout_data)
+            _validate_exercise_keys(workout_data)
 
             # Pass dict directly - library handles conversion
             result = garmin_client.upload_workout(workout_data)
@@ -1136,6 +1253,7 @@ def register_tools(app):
                 _normalize_workout_steps(workout_data)
                 _validate_end_condition_steps(workout_data)
                 _validate_target_type_steps(workout_data)
+                _validate_exercise_keys(workout_data)
                 result = garmin_client.upload_workout(workout_data)
                 if isinstance(result, dict):
                     entry = {
@@ -1500,6 +1618,7 @@ def register_tools(app):
                     _normalize_workout_steps(workout_data)
                     _validate_end_condition_steps(workout_data)
                     _validate_target_type_steps(workout_data)
+                    _validate_exercise_keys(workout_data)
                     upload_result = garmin_client.upload_workout(workout_data)
                     if not isinstance(upload_result, dict) or upload_result.get('workoutId') is None:
                         results.append({
