@@ -236,6 +236,23 @@ def _clean_streak(history):
     return streak
 
 
+def _training_plan_id(activity_id):
+    """The Garmin training plan an activity was run from, or None.
+
+    Plan workouts (e.g. a Run Coach plan's 40/20 circuits) are addressed by
+    UUID and leave the list entry's workoutId empty, so only the activity's
+    metadataDTO says the exercise names came from a card. Failures count as
+    "no plan": the session is then treated as freestyle, never invented.
+    """
+    try:
+        activity = garmin_client.get_activity(activity_id)
+    except Exception:
+        return None
+    meta = activity.get("metadataDTO") if isinstance(activity, dict) else None
+    plan_id = meta.get("trainingPlanId") if isinstance(meta, dict) else None
+    return plan_id if isinstance(plan_id, int) else None
+
+
 def _session_date(activity):
     return (activity.get("startTimeLocal") or "")[:10]
 
@@ -263,17 +280,21 @@ def register_tools(app):
           first ran past the ceiling (set 1 absorbs the transition). None when
           the card had no rep target or the card was since deleted.
           `clean_streak` counts clean sessions back from the newest.
-        - Rungs and prescriptions come only from CARD-RUN sessions (the
-          activity has a workoutId). Sessions without a card — app circuits,
-          freestyle — have auto-classified sets: they count toward pattern
-          sets but never move a rung. Warm-up and cool-down steps on a card
-          are excluded.
+        - Rungs come only from GUIDED sessions, whose exercise names came from
+          a workout rather than the watch's guesswork: a coach card (the
+          activity has a workoutId; prescriptions are read from it) or a
+          Garmin training-plan workout (`card_status: "garmin plan workout"`;
+          the plan's card can't be fetched from the activity, so no
+          prescription and `clean: null`). Freestyle sessions have
+          auto-classified sets: they count toward pattern sets but never
+          move a rung. Warm-up and cool-down steps on a coach card are
+          excluded.
         - The ladders are generic defaults; the coach's plan owns the
           athlete's standard for stepping up and the target rung.
 
         Args:
             end_date: last day of the window, YYYY-MM-DD (default today)
-            weeks: window length in weeks (default 8, 1-26; ~2 API calls
+            weeks: window length in weeks (default 8, 1-26; 2-3 API calls
                 per strength session)
         """
         weeks = max(1, min(int(weeks or 8), 26))
@@ -306,6 +327,7 @@ def register_tools(app):
             wid = a.get("workoutId")
             session = {"date": date, "activity_id": aid, "name": a.get("activityName")}
             steps = {}
+            guided = bool(wid)
             if wid:
                 session["card"] = wid
                 if wid not in cards:
@@ -317,7 +339,13 @@ def register_tools(app):
                 if cards[wid] is None:
                     session["card_status"] = "deleted"
             else:
-                session["card_status"] = "none - auto-classified sets"
+                plan_id = _training_plan_id(aid)
+                if plan_id:
+                    guided = True
+                    session["card_status"] = "garmin plan workout"
+                    session["plan"] = plan_id
+                else:
+                    session["card_status"] = "none - auto-classified sets"
             try:
                 payload = garmin_client.get_activity_exercise_sets(aid) or {}
             except Exception as e:
@@ -369,8 +397,8 @@ def register_tools(app):
                 if loads:
                     entry["top_kg"] = max(loads)
                 ex = exercises.setdefault(key, {"history": []})
-                ex["history"].append(_judge(entry) if wid else entry)
-                if wid and key in _RUNG_OF:
+                ex["history"].append(_judge(entry) if guided else entry)
+                if guided and key in _RUNG_OF:
                     ladder, rung = _RUNG_OF[key]
                     ladder_hits.setdefault(ladder, []).append((date, rung, key))
 

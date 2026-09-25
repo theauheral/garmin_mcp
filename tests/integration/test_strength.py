@@ -173,6 +173,27 @@ async def test_uncarded_session_counts_sets_but_never_moves_a_rung(app, mock_gar
     mock_garmin_client.get_activity_exercise_sets.assert_called_once_with(3)
 
 
+async def test_plan_workout_moves_a_rung_without_a_verdict(app, mock_garmin_client):
+    # A Run Coach plan circuit: no workoutId on the list entry, the plan id
+    # only in the activity's metadata; 40 s timed sets whose rep counts are noise.
+    mock_garmin_client.get_activities_by_date.return_value = [_activity(7, "2026-09-17")]
+    mock_garmin_client.get_activity.return_value = {
+        "metadataDTO": {"trainingPlanId": 47608131, "associatedWorkoutId": None}}
+    mock_garmin_client.get_activity_exercise_sets.return_value = {"exerciseSets": [
+        _set(0, "PUSH_UP", "PUSH_UP", 4, 40),
+        _set(2, "PUSH_UP", "PUSH_UP", 0, 40),
+    ]}
+
+    data = await _call(app, end_date="2026-09-20", weeks=1)
+
+    session = data["sessions"][0]
+    assert session["card_status"] == "garmin plan workout" and session["plan"] == 47608131
+    assert data["ladders"]["push_up"]["on"] == ["PUSH_UP/PUSH_UP"]
+    assert "clean_streak" not in data["ladders"]["push_up"]
+    assert data["exercises"]["PUSH_UP/PUSH_UP"]["history"][0]["clean"] is None
+    mock_garmin_client.get_workout_by_id.assert_not_called()
+
+
 async def test_deleted_card_keeps_sets_with_unknown_verdict(app, mock_garmin_client):
     mock_garmin_client.get_activities_by_date.return_value = [
         _activity(5, "2026-09-01", workout_id=99)]
