@@ -7,9 +7,14 @@ must not take down the whole brief, so each block is fetched in isolation and
 failures are reported in an "errors" map instead of raising.
 """
 
+import asyncio
 import datetime
 import json
+from concurrent.futures import ThreadPoolExecutor
 from statistics import fmean
+
+from .health_wellness import _recovery_from_readiness
+from .training import _extract_dated_vo2_measurements, _get_max_metrics_range
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -314,19 +319,35 @@ def _performance_condition(details):
 
 
 def _resolve_activity(activity_id, date):
-    """Resolve one activity to (summary_payload, activity_id, note): an
-    explicit id, else a date's main activity, else the most recent one.
-    note is set (and the payload None) when nothing was found."""
+    """Resolve one activity to (summary_payload, activity_id, note, others):
+    an explicit id, else a date's main activity, else the most recent one.
+    note is set (and the payload None) when nothing was found.
+
+    A date's "main" activity is its longest by timer time. The list endpoint
+    is newest-first, so taking the first item would audit the cool-down walk
+    that followed the run. The rest come back in `others` so the caller can
+    name them and the athlete can ask for one by id.
+    """
     if activity_id:
-        return garmin_client.get_activity(activity_id) or {}, activity_id, None
+        return garmin_client.get_activity(activity_id) or {}, activity_id, None, []
     if date:
         acts = garmin_client.get_activities_by_date(date, date) or []
     else:
         acts = garmin_client.get_activities(0, 1) or []
     acts = [a for a in acts if isinstance(a, dict)]
     if not acts:
-        return None, None, f"no activity found for {date or 'most recent'}"
-    return acts[0], acts[0].get("activityId"), None
+        return None, None, f"no activity found for {date or 'most recent'}", []
+    main = max(acts, key=lambda a: a.get("duration") or 0)
+    others = [
+        _drop_none({
+            "activity_id": a.get("activityId"),
+            "type": (a.get("activityType") or {}).get("typeKey"),
+            "start": (a.get("startTimeLocal") or "")[11:16] or None,
+            "duration_min": _minutes(a.get("duration")),
+        })
+        for a in acts if a is not main
+    ]
+    return main, main.get("activityId"), None, others
 
 
 def _full_activity(summary, aid):
@@ -466,30 +487,85 @@ _HR_STREAM_SAMPLES = 2000
 # weighting makes the result invariant to decimation (identical easy-share from
 # 300 to 5000 samples on a 49-minute run), so the trend buys the cheap one.
 _HR_STREAM_SAMPLES_TREND = 500
-# A gap longer than this is an auto-pause or a dropout, not time spent in a
-# zone — counting it would credit whichever zone happened to precede it.
+# A gap longer than this is a dropout, not time spent in a zone — counting it
+# would credit whichever zone happened to precede it. It is a floor: a heavily
+# decimated stream (a long activity at the trend's sample budget) spaces its
+# samples wider than this, so the cap scales with the stream's own spacing.
 _HR_GAP_CAP_S = 60
+
+# Garmin's zone floors as fractions of the anchor, measured rather than
+# documented: live %LTHR floors at LTHR 173 and 171 (112/137/152/163/171 and
+# 111/135/150/161/169) both reproduce to the bpm from these ratios, and %max
+# zones are Garmin's stock 50/60/70/80/90. They are what turns "LTHR = 172"
+# into bands, and what recognises which basis a set of floors was built on.
+_LTHR_ZONE_RATIOS = (0.65, 0.79, 0.88, 0.94, 0.99)
+_PCT_ZONE_RATIOS = (0.50, 0.60, 0.70, 0.80, 0.90)
+_BASIS_TOLERANCE_BPM = 2
+# What each training method's floors should look like.
+_METHOD_BASIS = {
+    "LACTATE_THRESHOLD": "pct_lthr",
+    "HR_MAX": "pct_max_hr",
+    "HR_RESERVE": "pct_hrr",
+}
+
+
+def _zone_sport(type_key):
+    """The zone-config sport for an activity typeKey. Garmin keeps DEFAULT,
+    RUNNING and CYCLING zone sets independently; anything else uses DEFAULT."""
+    key = (type_key or "").lower()
+    if "run" in key:
+        return "RUNNING"
+    if "cycl" in key or "bik" in key or "ride" in key:
+        return "CYCLING"
+    return "DEFAULT"
+
+
+def _floors_basis(floors, lthr=None, max_hr=None, resting_hr=None):
+    """Which anchor a set of floors was built from: pct_lthr, pct_max_hr,
+    pct_hrr, or custom. Recognised within a couple of bpm of Garmin's rounding."""
+
+    def _fits(expected):
+        return all(abs(f - e) <= _BASIS_TOLERANCE_BPM for f, e in zip(floors, expected))
+
+    candidates = []
+    if isinstance(lthr, (int, float)) and lthr > 0:
+        candidates.append(("pct_lthr", [lthr * r for r in _LTHR_ZONE_RATIOS]))
+    if isinstance(max_hr, (int, float)) and max_hr > 0:
+        candidates.append(("pct_max_hr", [max_hr * r for r in _PCT_ZONE_RATIOS]))
+        if isinstance(resting_hr, (int, float)) and 0 < resting_hr < max_hr:
+            candidates.append((
+                "pct_hrr",
+                [resting_hr + r * (max_hr - resting_hr) for r in _PCT_ZONE_RATIOS],
+            ))
+    for basis, expected in candidates:
+        if _fits(expected):
+            return basis
+    return "custom"
+
+
+def _lthr_floors(lthr):
+    return [int(round(lthr * r)) for r in _LTHR_ZONE_RATIOS]
 
 
 def _zone_model_from_config(entries, sport="DEFAULT"):
     """Pull the zone floors for one sport out of Garmin's zone-config payload.
 
     The config is the live model — what the watch applies today — as opposed to
-    the bands frozen into each activity at upload time.
+    the bands frozen into each activity at upload time. A sport without its own
+    entry falls back to DEFAULT, which is what the watch does.
     """
     if isinstance(entries, dict):
         entries = [entries]
     if not isinstance(entries, list):
         return None
-    chosen = None
+    by_sport = {}
     for e in entries:
-        if not isinstance(e, dict):
-            continue
-        if (e.get("sport") or "").upper() == sport.upper():
-            chosen = e
-            break
-        if chosen is None:
-            chosen = e
+        if isinstance(e, dict):
+            by_sport.setdefault((e.get("sport") or "").upper(), e)
+    wanted = sport.upper()
+    chosen = by_sport.get(wanted) or by_sport.get("DEFAULT")
+    if chosen is None and by_sport:
+        chosen = next(iter(by_sport.values()))
     if not chosen:
         return None
     floors = []
@@ -505,18 +581,20 @@ def _zone_model_from_config(entries, sport="DEFAULT"):
         "resting_hr": chosen.get("restingHeartRateUsed"),
         "training_method": chosen.get("trainingMethod"),
         "sport": chosen.get("sport"),
+        "sport_requested": wanted,
     }
 
 
 def _hr_zone_model(lthr=None, sport="DEFAULT"):
-    """The zone model to score against: Garmin's live config, optionally
-    re-anchored to a caller-supplied LTHR.
+    """The zone model to score against: Garmin's live config for `sport`, or
+    %LTHR bands built from a caller-supplied LTHR.
 
-    The LTHR is a parameter and never a constant because the two sources
-    disagree in practice — Garmin auto-detects one value while a coaching plan
-    may be written against another, and ~5 bpm moves every boundary. Whichever
-    is applied is echoed back in the output so a wrong one is diagnosable
-    rather than silent. Returns (model, None) or (None, reason).
+    The LTHR is a parameter and never a constant because the sources disagree
+    in practice — Garmin auto-detects one value, a field test measures another
+    — and ~5 bpm moves every boundary. The model also says which basis its
+    floors were really built on: Garmin has been seen labelling a config
+    LACTATE_THRESHOLD while serving 50–90% of max HR, which silently turns an
+    "easy" cap into a Z4 floor. Returns (model, None) or (None, reason).
     """
     try:
         raw = garmin_client.connectapi(_HR_ZONES_PATH)
@@ -532,50 +610,96 @@ def _hr_zone_model(lthr=None, sport="DEFAULT"):
         "training_method": base["training_method"],
         "max_hr": base["max_hr"],
         "resting_hr": base["resting_hr"],
+        "sport": base["sport"],
         "floors": list(base["floors"]),
     }
+    if base["sport"] and (base["sport"] or "").upper() != base["sport_requested"]:
+        model["sport_note"] = (
+            f"no {base['sport_requested']} zone set; scored on {base['sport']}"
+        )
+    basis = _floors_basis(model["floors"], base["lthr"], base["max_hr"], base["resting_hr"])
+    model["floors_basis"] = basis
+    expected = _METHOD_BASIS.get((base["training_method"] or "").upper())
+    if expected and basis != expected:
+        model["method_mismatch"] = (
+            f"Garmin labels these zones {base['training_method']} but the floors "
+            f"{model['floors']} are {basis.replace('_', ' ')}"
+            + (f" (max HR {base['max_hr']})" if basis == "pct_max_hr" else "")
+            + " — the label is wrong, and every share scored on them inherits that"
+        )
     if lthr:
-        configured = base["lthr"]
-        if not isinstance(configured, (int, float)) or configured <= 0:
-            model["lthr_override_ignored"] = (
-                f"no configured LTHR to rescale from; used the zone config as-is"
-            )
-        else:
-            # Garmin's own floors move linearly with LTHR (verified against two
-            # activities stamped under different LTHRs), so rescaling by the
-            # ratio reproduces the bands the watch would have applied.
-            scale = lthr / configured
-            model["floors"] = [int(round(f * scale)) for f in base["floors"]]
-            model["lthr_configured"] = configured
-            model["lthr"] = lthr
-            model["lthr_source"] = "caller_override"
+        # Built from Garmin's own %LTHR ratios, never by rescaling the config:
+        # rescaling only works when the config is itself %LTHR, and it isn't
+        # always (see method_mismatch).
+        model["floors"] = _lthr_floors(lthr)
+        model["floors_basis"] = "pct_lthr"
+        model["lthr_configured"] = base["lthr"]
+        model["lthr"] = lthr
+        model["lthr_source"] = "caller_override"
+        model.pop("method_mismatch", None)
     model["floors_bpm"] = {f"z{i}": f for i, f in enumerate(model["floors"], start=1)}
     return model, None
 
 
+def _model_summary(model):
+    """The model fields every consumer should see beside a recomputed share."""
+    return _drop_none({
+        "lthr": model.get("lthr"),
+        "lthr_source": model.get("lthr_source"),
+        "lthr_configured": model.get("lthr_configured"),
+        "training_method": model.get("training_method"),
+        "floors_basis": model.get("floors_basis"),
+        "method_mismatch": model.get("method_mismatch"),
+        "max_hr": model.get("max_hr"),
+        "sport": model.get("sport"),
+        "sport_note": model.get("sport_note"),
+        "floors_bpm": model.get("floors_bpm"),
+    })
+
+
 # An activity's samples never change after upload, so a scheduled agent calling
 # get_execution_trend repeatedly re-downloads the same bytes. Memoise the stream
-# — never the recomputation, which depends on a zone model that does drift.
+# — never the recomputation, which depends on a zone model that does drift —
+# and never a failure: a timeout or a 429 is transient, and caching it would
+# make the activity unrecomputable until the server restarts.
 _STREAM_CACHE_MAX = 64
 
 
-def _hr_stream(activity_id, max_samples=_HR_STREAM_SAMPLES):
-    """(elapsed_seconds, bpm) samples for one activity, or (None, reason).
+def _activity_stream(activity_id, max_samples=_HR_STREAM_SAMPLES):
+    """Timer-time sample rows for one activity, or (None, reason).
 
-    maxpoly=0 drops the GPS polyline: this needs two columns of a 26-column
-    payload and the track is the bulk of it.
+    Rows are dicts with t (timer seconds), hr, and — when recorded — dist
+    (metres) and speed (m/s).
     """
     key = (activity_id, max_samples)
     if key in _STREAM_CACHE:
-        return _STREAM_CACHE[key]
-    result = _fetch_hr_stream(activity_id, max_samples)
+        return _STREAM_CACHE[key], None
+    rows, reason = _fetch_stream(activity_id, max_samples)
+    if rows is None:
+        return None, reason
     if len(_STREAM_CACHE) >= _STREAM_CACHE_MAX:
         _STREAM_CACHE.pop(next(iter(_STREAM_CACHE)))
-    _STREAM_CACHE[key] = result
-    return result
+    _STREAM_CACHE[key] = rows
+    return rows, None
 
 
-def _fetch_hr_stream(activity_id, max_samples):
+def _hr_stream(activity_id, max_samples=_HR_STREAM_SAMPLES):
+    """(timer_seconds, bpm) samples for one activity, or (None, reason)."""
+    rows, reason = _activity_stream(activity_id, max_samples)
+    if rows is None:
+        return None, reason
+    return [(r["t"], r["hr"]) for r in rows], None
+
+
+def _fetch_stream(activity_id, max_samples):
+    """maxpoly=0 drops the GPS polyline: this needs a few columns of a
+    26-column payload and the track is the bulk of it.
+
+    Time is TIMER time (sumDuration), not elapsed: it stops while the activity
+    is paused, which is what Garmin's own zone times count. Measured on twelve
+    runs: timer time reproduces the stored zone minutes exactly, elapsed time
+    over-counts every stop at a crossing into the zone before it.
+    """
     try:
         details = garmin_client.get_activity_details(
             activity_id, maxchart=max_samples, maxpoly=0
@@ -589,23 +713,52 @@ def _fetch_hr_stream(activity_id, max_samples):
         if isinstance(d, dict) and isinstance(d.get("metricsIndex"), int):
             index[d.get("key")] = d["metricsIndex"]
     hr_i = index.get("directHeartRate")
-    t_i = index.get("sumElapsedDuration", index.get("sumDuration"))
+    t_i = index.get("sumDuration", index.get("sumElapsedDuration"))
+    dist_i = index.get("sumDistance")
+    speed_i = index.get("directSpeed")
     if hr_i is None:
         return None, "activity has no heart-rate stream (manual entry, or HR not recorded)"
     if t_i is None:
-        return None, "activity stream carries no elapsed-time column"
-    samples = []
+        return None, "activity stream carries no timer column"
+
+    def _num(m, i):
+        if i is None or i >= len(m):
+            return None
+        v = m[i]
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    rows = []
     for row in details.get("activityDetailMetrics") or []:
         m = row.get("metrics") if isinstance(row, dict) else None
-        if not isinstance(m, list) or len(m) <= max(hr_i, t_i):
+        if not isinstance(m, list):
             continue
-        hr, t = m[hr_i], m[t_i]
-        if isinstance(hr, (int, float)) and isinstance(t, (int, float)) and hr > 0:
-            samples.append((t, hr))
-    if len(samples) < 2:
+        hr, t = _num(m, hr_i), _num(m, t_i)
+        if hr is None or t is None or hr <= 0:
+            continue
+        rows.append({"t": t, "hr": hr, "dist": _num(m, dist_i), "speed": _num(m, speed_i)})
+    if len(rows) < 2:
         return None, "activity has no usable heart-rate samples"
-    samples.sort(key=lambda s: s[0])
-    return samples, None
+    rows.sort(key=lambda r: r["t"])
+    return rows, None
+
+
+def _gap_cap(samples):
+    """The longest gap still counted as continuous time: the floor, or three
+    sample spacings when the stream is decimated wider than the floor."""
+    gaps = sorted(t1 - t0 for (t0, _), (t1, _) in zip(samples, samples[1:]) if t1 > t0)
+    if not gaps:
+        return _HR_GAP_CAP_S
+    return max(_HR_GAP_CAP_S, 3 * gaps[len(gaps) // 2])
+
+
+def _weighted(samples):
+    """(bpm, seconds) per sample, weighting each by the gap to the next and
+    dropping gaps too long to be continuous recording."""
+    cap = _gap_cap(samples)
+    for (t0, hr), (t1, _) in zip(samples, samples[1:]):
+        dt = t1 - t0
+        if 0 < dt <= cap:
+            yield hr, dt
 
 
 def _integrate_zones(samples, floors):
@@ -617,10 +770,7 @@ def _integrate_zones(samples, floors):
     """
     secs = {n: 0.0 for n in range(1, len(floors) + 1)}
     below = 0.0
-    for (t0, hr), (t1, _) in zip(samples, samples[1:]):
-        dt = t1 - t0
-        if dt <= 0 or dt > _HR_GAP_CAP_S:
-            continue
+    for hr, dt in _weighted(samples):
         zone = 0
         for n, floor in enumerate(floors, start=1):
             if hr >= floor:
@@ -630,6 +780,105 @@ def _integrate_zones(samples, floors):
         else:
             below += dt
     return secs, below
+
+
+def _ceiling_share(samples, ceiling):
+    """Time at or under an HR ceiling — the coaching plan's own easy cap,
+    independent of whatever zone model Garmin is serving this week."""
+    under = over = 0.0
+    hr_secs = 0.0
+    for hr, dt in _weighted(samples):
+        hr_secs += hr * dt
+        if hr <= ceiling:
+            under += dt
+        else:
+            over += dt
+    total = under + over
+    if total <= 0:
+        return None
+    return {
+        "ceiling_bpm": ceiling,
+        "under_pct": round(100 * under / total),
+        "over_min": _round(over / 60),
+        "avg_hr": _round(hr_secs / total),
+    }
+
+
+def _threshold_test(rows, effort_min=30, tail_min=20, garmin_lthr=None):
+    """Read a 30-minute threshold field test out of one activity's stream.
+
+    The protocol (Friel): warm up, run 30 minutes as hard as can be held
+    evenly, cool down; LTHR = average HR over the LAST 20 minutes of the
+    effort, threshold pace = its pace. The effort is located as the 30-minute
+    timer window with the highest time-weighted HR, so the warm-up and
+    cool-down fall outside it without being declared.
+    """
+    samples = [(r["t"], r["hr"]) for r in rows]
+    cap = _gap_cap(samples)
+    effort_s, tail_s = effort_min * 60, tail_min * 60
+    if samples[-1][0] - samples[0][0] < effort_s:
+        return {"not_applicable": f"activity shorter than the {effort_min}-minute effort"}
+
+    # Prefix sums of HR*dt and dt over sample intervals, gaps over the cap
+    # contributing nothing — the window average is then O(1).
+    n = len(samples)
+    hr_sum, t_sum = [0.0] * n, [0.0] * n
+    for i in range(1, n):
+        dt = samples[i][0] - samples[i - 1][0]
+        ok = 0 < dt <= cap
+        hr_sum[i] = hr_sum[i - 1] + (samples[i - 1][1] * dt if ok else 0.0)
+        t_sum[i] = t_sum[i - 1] + (dt if ok else 0.0)
+
+    def _avg(i, j):
+        secs = t_sum[j] - t_sum[i]
+        return (hr_sum[j] - hr_sum[i]) / secs if secs > 0 else None
+
+    best = None
+    j = 0
+    for i in range(n):
+        while j < n - 1 and samples[j][0] - samples[i][0] < effort_s:
+            j += 1
+        if samples[j][0] - samples[i][0] < effort_s:
+            break
+        a = _avg(i, j)
+        if a is not None and (best is None or a > best[0]):
+            best = (a, i, j)
+    if best is None:
+        return {"not_applicable": "no continuous 30-minute stretch in the HR stream"}
+    _, i0, j0 = best
+    k = i0
+    while k < j0 and samples[j0][0] - samples[k][0] > tail_s:
+        k += 1
+    lthr = _avg(k, j0)
+    first10 = _avg(i0, k)
+
+    pace = None
+    d0, d1 = rows[k].get("dist"), rows[j0].get("dist")
+    tail_secs = samples[j0][0] - samples[k][0]
+    if isinstance(d0, (int, float)) and isinstance(d1, (int, float)) and d1 > d0:
+        pace = round(tail_secs / ((d1 - d0) / 1000))
+    else:
+        speeds = [r["speed"] for r in rows[k:j0 + 1] if isinstance(r.get("speed"), (int, float)) and r["speed"] > 0]
+        if speeds:
+            pace = round(1000 / fmean(speeds))
+
+    out = {
+        "protocol": f"{effort_min}-min effort, LTHR = avg HR of its last {tail_min} min",
+        "effort_window_min": [_round(samples[i0][0] / 60), _round(samples[j0][0] / 60)],
+        "lthr_estimate_bpm": round(lthr) if lthr else None,
+        "threshold_pace_s_per_km": pace,
+        "first_10_min_avg_hr": round(first10) if first10 else None,
+        # A 30-minute effort that was paced evenly rises a few bpm across the
+        # window; a big jump means a hot start or a finishing kick, and the
+        # tail average reads high.
+        "caveat": "valid only for a solo, evenly paced, all-out 30 minutes — "
+                  "a race, a group run or a surge-and-fade reads high or low",
+    }
+    if out["lthr_estimate_bpm"]:
+        out["lt_zone_floors_bpm"] = _lthr_floors(out["lthr_estimate_bpm"])
+    if garmin_lthr:
+        out["garmin_lthr_bpm"] = garmin_lthr
+    return _drop_none(out)
 
 
 def _shares(secs):
@@ -671,15 +920,7 @@ def _recompute_hr_zones(activity_id, model, stored=None, samples=None,
             }
             for n, v in secs.items()
         },
-        "applied": _drop_none({
-            "lthr": model.get("lthr"),
-            "lthr_source": model.get("lthr_source"),
-            "lthr_configured": model.get("lthr_configured"),
-            "lthr_override_ignored": model.get("lthr_override_ignored"),
-            "training_method": model.get("training_method"),
-            "max_hr": model.get("max_hr"),
-            "floors_bpm": model.get("floors_bpm"),
-        }),
+        "applied": _model_summary(model),
         "samples": len(samples),
     }
     verification = _verify_against_stored(samples, stored, model["floors"])
@@ -840,6 +1081,162 @@ def _pacing(lap_rows):
     }
 
 
+def _utc_offset_hours(bb_day):
+    """Local-minus-GMT hours from a body-battery day's own paired timestamps."""
+    gmt, local = bb_day.get("startTimestampGMT"), bb_day.get("startTimestampLocal")
+    if not (isinstance(gmt, str) and isinstance(local, str)):
+        return None
+    try:
+        delta = (datetime.datetime.fromisoformat(local[:19])
+                 - datetime.datetime.fromisoformat(gmt[:19]))
+    except ValueError:
+        return None
+    return delta.total_seconds() / 3600
+
+
+def _utc_offset_from_events(date):
+    try:
+        for e in garmin_client.get_body_battery_events(date) or []:
+            off = (e.get("event") or {}).get("timezoneOffset") if isinstance(e, dict) else None
+            if isinstance(off, (int, float)):
+                return off / 3600000
+    except Exception:
+        return None
+    return None
+
+
+def _energy_windows(curve):
+    """Best and worst 2-hour windows (adjacent hours averaged), falling back
+    to single hours when fewer than two adjacent pairs were recorded — one
+    pair would make the peak and the trough the same window."""
+    pairs = [
+        (a["hour"], round((a["level"] + b["level"]) / 2))
+        for a, b in zip(curve, curve[1:]) if b["hour"] == a["hour"] + 1
+    ]
+    if len(pairs) >= 2:
+        best, worst = max(pairs, key=lambda p: p[1]), min(pairs, key=lambda p: p[1])
+        return (
+            {"from_hour": best[0], "to_hour": best[0] + 2, "level": best[1]},
+            {"from_hour": worst[0], "to_hour": worst[0] + 2, "level": worst[1]},
+        )
+    if len(curve) >= 2:
+        best = max(curve, key=lambda c: c["level"])
+        worst = min(curve, key=lambda c: c["level"])
+        return (
+            {"from_hour": best["hour"], "to_hour": best["hour"] + 1, "level": best["level"]},
+            {"from_hour": worst["hour"], "to_hour": worst["hour"] + 1, "level": worst["level"]},
+        )
+    return None, None
+
+
+def _plan_summary(p, today):
+    """One enrolled Garmin plan: identity, status, dates, and where today
+    falls in it. The list endpoint returns the athlete's own enrolments
+    (scheduled, in progress and completed), not the catalogue."""
+    start = (p.get("startDate") or "")[:10] or None
+    end = (p.get("endDate") or "")[:10] or None
+    out = {
+        "id": p.get("trainingPlanId"),
+        "name": p.get("name"),
+        "category": p.get("trainingPlanCategory"),
+        "adaptive": "ADAPTIVE" in (p.get("trainingPlanCategory") or "") or None,
+        "status": (p.get("trainingStatus") or {}).get("statusKey"),
+        "sport": (p.get("trainingType") or {}).get("typeKey"),
+        "version": (p.get("trainingVersion") or {}).get("versionName"),
+        "weeks": p.get("durationInWeeks"),
+        "avg_weekly_workouts": p.get("avgWeeklyWorkouts"),
+        "start_date": start,
+        "end_date": end,
+    }
+    try:
+        if end:
+            out["days_to_end"] = (datetime.date.fromisoformat(end) - today).days
+        if start and datetime.date.fromisoformat(start) <= today:
+            out["current_week"] = (today - datetime.date.fromisoformat(start)).days // 7 + 1
+    except ValueError:
+        pass
+    return _drop_none(out)
+
+
+def _adaptive_plan_detail(plan_id, today):
+    """Phases and the upcoming sessions of an adaptive (Garmin Coach) plan.
+
+    Garmin generates an adaptive plan only about a week ahead and drops
+    sessions once they pass, so this is the whole of what exists: there are
+    no future weeks to show and no history to go back to.
+    """
+    raw = garmin_client.get_adaptive_training_plan_by_id(plan_id) or {}
+    phases = [
+        _drop_none({
+            "phase": ph.get("trainingPhase"),
+            "start": ph.get("startDate"),
+            "end": ph.get("endDate"),
+            "current": ph.get("currentPhase") or None,
+        })
+        for ph in raw.get("adaptivePlanPhases") or [] if isinstance(ph, dict)
+    ]
+    upcoming = []
+    for task in raw.get("taskList") or []:
+        if not isinstance(task, dict) or (task.get("calendarDate") or "") < today.isoformat():
+            continue
+        w = task.get("taskWorkout") or {}
+        upcoming.append(_drop_none({
+            "date": task.get("calendarDate"),
+            "sport": (w.get("sportType") or {}).get("sportTypeKey"),
+            "name": w.get("workoutName"),
+            "target": w.get("workoutDescription"),
+            "est_min": _minutes(w.get("estimatedDurationInSecs")),
+            "effect": w.get("trainingEffectLabel") if w.get("trainingEffectLabel") != "INVALID" else None,
+            "long": task.get("longWkt") or None,
+            "rest_day": w.get("restDay") or None,
+            "status": w.get("adaptiveCoachingWorkoutStatus"),
+            "workout_uuid": w.get("workoutUuid"),
+        }))
+    upcoming.sort(key=lambda t: t.get("date") or "")
+    return _drop_none({"phases": phases or None, "upcoming": upcoming or None})
+
+
+def _vo2_as_of(end, then):
+    """VO2 max as of `end` and as of `then`, carrying the last measurement
+    forward.
+
+    Garmin writes a VO2 value only on days it recomputes one (after a
+    qualifying activity), so a single-day lookup is usually empty and the
+    4-week change came back None with no reason. One range call covers both
+    dates; each takes the newest measurement on or before it.
+    """
+    start = (then - datetime.timedelta(days=60)).isoformat()
+    supported, data = _get_max_metrics_range(garmin_client, start, end.isoformat())
+    if supported:
+        by_date = _extract_dated_vo2_measurements(data)
+    else:
+        # No range endpoint on this client: the two single days, as before.
+        by_date = {}
+        for day in (then, end):
+            payload = garmin_client.get_max_metrics(day.isoformat()) or []
+            item = payload[0] if isinstance(payload, list) and payload else {}
+            generic = (item.get("generic") or {}) if isinstance(item, dict) else {}
+            v = generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue")
+            if isinstance(v, (int, float)):
+                by_date[day.isoformat()] = {"running": v}
+
+    def _latest(day, sport):
+        best = None
+        for d, m in by_date.items():
+            if d <= day.isoformat() and sport in m and (best is None or d > best[0]):
+                best = (d, m[sport])
+        return best
+
+    sport = "running" if any("running" in m for m in by_date.values()) else "cycling"
+    return _latest(end, sport), _latest(then, sport), sport
+
+
+# Concurrent Garmin calls per trend. The trend makes three calls per session;
+# run serially that is ~11 s for ten runs. Four in flight cuts it to a few
+# seconds without looking like a burst to Garmin's rate limiter.
+_TREND_WORKERS = 4
+
+
 def register_tools(app):
     """Register composite brief tools with the MCP server app"""
 
@@ -878,6 +1275,10 @@ def register_tools(app):
                             "stress_history": r.get("stressHistoryFactorPercent"),
                         }
                     ),
+                    # The on-watch recovery clock, from the same payload.
+                    "recovery_hours": (
+                        _recovery_from_readiness(readiness_list, "training_readiness") or {}
+                    ).get("remaining_hours"),
                 }
             )
         except Exception as e:
@@ -1064,7 +1465,7 @@ def register_tools(app):
             dur = dto.get("sleepTimeSeconds")
             report["sleep_last_night"] = _drop_none(
                 {
-                    "score": (dto.get("sleepScores") or {}).get("overall", {}).get("value"),
+                    "score": ((dto.get("sleepScores") or {}).get("overall") or {}).get("value"),
                     "duration_h": _round(dur / 3600, 2) if isinstance(dur, (int, float)) else None,
                     "resting_hr": sleep.get("restingHeartRate"),
                     "overnight_hrv_ms": sleep.get("avgOvernightHrv"),
@@ -1130,28 +1531,40 @@ def register_tools(app):
         except Exception as e:
             errors["load"] = str(e)
 
+        fitness = {}
         try:
-            vo2_now = ((garmin_client.get_max_metrics(end_date) or [{}])[0].get("generic") or {})
-            vo2_past = ((garmin_client.get_max_metrics(d4w) or [{}])[0].get("generic") or {})
-            now_v = vo2_now.get("vo2MaxPreciseValue") or vo2_now.get("vo2MaxValue")
-            past_v = vo2_past.get("vo2MaxPreciseValue") or vo2_past.get("vo2MaxValue")
-            fitness = {
-                "vo2max_now": now_v,
-                "vo2max_4w_ago": past_v,
+            now_m, past_m, sport = _vo2_as_of(end, end - datetime.timedelta(days=28))
+            now_v, past_v = (now_m or (None, None))[1], (past_m or (None, None))[1]
+            fitness.update({
+                "vo2max_now": _round(now_v),
+                "vo2max_measured_on": now_m[0] if now_m else None,
+                "vo2max_4w_ago": _round(past_v),
                 "vo2max_change": _round(now_v - past_v, 1) if isinstance(now_v, (int, float)) and isinstance(past_v, (int, float)) else None,
-            }
+                "vo2max_sport": sport if now_m else None,
+                "vo2max_note": None if now_m and past_m else "no VO2 max measurement in the 60 days before one of the two dates",
+            })
+        except Exception as e:
+            errors["vo2max"] = str(e)
+        try:
             score_dto = (garmin_client.get_endurance_score(window_start, end_date) or {}).get("enduranceScoreDTO") or {}
             fitness["endurance_score"] = score_dto.get("overallScore") or score_dto.get("score")
-            report["fitness"] = _drop_none(fitness)
         except Exception as e:
-            errors["fitness"] = str(e)
+            errors["endurance_score"] = str(e)
+        if _drop_none(fitness):
+            report["fitness"] = _drop_none(fitness)
 
         if errors:
             report["errors"] = errors
         return json.dumps(report, indent=2)
 
     @app.tool()
-    async def get_session_analysis(date: str = "", activity_id: int = 0, lthr: int = 0) -> str:
+    async def get_session_analysis(
+        date: str = "",
+        activity_id: int = 0,
+        lthr: int = 0,
+        easy_ceiling_bpm: int = 0,
+        threshold_test: bool = False,
+    ) -> str:
         """Objective execution quality for one training session: HR time-in-zones
         with zone boundaries (easy vs hard share — did an "easy" run stay
         aerobic?), POWER time-in-zones (no cardiac lag or heat inflation — the
@@ -1159,107 +1572,136 @@ def register_tools(app):
         the objective read, per-split pacing with fade/negative-split
         detection, cadence + stride length, session cost (stamina, body
         battery, sweat), terrain with grade-adjusted pace, and set/rep detail
-        for strength sessions. Pass a
-        `date` (analyses that day's main activity) or an explicit `activity_id`.
-        Use to audit whether a session was executed as intended — the key
-        discipline for aerobic-base building (easy runs must actually be easy).
+        for strength sessions. Pass a `date` (analyses that day's longest
+        activity; the others are listed in `other_activities_that_day`) or an
+        explicit `activity_id`. Use to audit whether a session was executed as
+        intended — the key discipline for aerobic-base building (easy runs
+        must actually be easy).
 
-        `hr_zones` carries Garmin's STORED zone times, which are frozen into the
-        activity at upload and never change afterwards — an activity recorded
-        under an old zone model keeps its old bands forever. `hr_zones.recomputed`
-        re-integrates time-in-zone from the raw HR sample stream against the
-        CURRENT zone model, so easy-share is comparable across a zone-model
-        change; read it in preference to the stored share, and use
-        `recomputed.verification.stored_bands_differ` to tell whether this activity was
-        affected at all. `recomputed.applied.lthr` names the threshold actually
-        used, and `recomputed.verification` re-scores the same stream with the
-        activity's own frozen bands — when it reproduces the stored share, the
-        recomputation is trustworthy. Activities with no HR stream (manual
-        entries) say so in `recomputed.not_recomputable` rather than quietly
-        falling back.
+        `hr_ceiling` (with `easy_ceiling_bpm`) is the zone-model-free check:
+        time at or under the plan's own HR cap and the time-weighted average
+        HR, straight from the raw stream. Prefer it when the plan has a cap.
+
+        `hr_zones` carries Garmin's STORED zone times, frozen into the activity
+        at upload. `hr_zones.recomputed` re-integrates the raw HR stream (timer
+        time) against the CURRENT zone model for the activity's sport;
+        `recomputed.applied` names that model — `floors_basis` says what the
+        floors really are built on and `method_mismatch` flags a config whose
+        label disagrees with its floors (Garmin has served 50–90% of max HR
+        under a LACTATE_THRESHOLD label). `recomputed.verification` re-scores
+        the same stream with the activity's own frozen bands; when it
+        reproduces the stored share the arithmetic is trustworthy.
+        Activities with no HR stream say so in `not_recomputable`.
 
         Args:
-            date: YYYY-MM-DD to analyse that day's main activity (optional)
+            date: YYYY-MM-DD to analyse that day's longest activity (optional)
             activity_id: explicit Garmin activity id (optional; overrides date)
-            lthr: override the lactate-threshold HR the zone model is anchored
-                to (optional; default reads Garmin's live zone configuration).
-                Every boundary scales with it, so a 5 bpm difference is worth
-                several points of easy-share — pass the coaching plan's value
-                when it disagrees with Garmin's auto-detected one.
+            lthr: score zones on %LTHR bands built from this threshold instead
+                of Garmin's live config (optional) — e.g. a field-tested LTHR
+            easy_ceiling_bpm: the coaching plan's easy HR cap (optional); adds
+                `hr_ceiling`
+            threshold_test: read this activity as a 30-minute LTHR field test
+                (optional); adds `threshold_test` — the hardest 30-minute
+                window, LTHR = average HR of its last 20 minutes, threshold
+                pace, and the %LTHR zone floors that LTHR implies
         """
-        result = {}
-        errors = {}
-        try:
-            summary, aid, note = _resolve_activity(activity_id, date)
-            if note:
-                return json.dumps({"note": note}, indent=2)
-            result["session"] = _drop_none(_summarize_session(summary))
-            result["activity_id"] = aid
-        except Exception as e:
-            return json.dumps({"error": str(e)}, indent=2)
-
-        form = _form_metrics(summary)
-        result["form"] = _drop_none({
-            "cadence_spm": form["cadence_spm"],
-            "stride_length_m": form["stride_length_m"],
-        }) or None
-
-        dto = _full_activity(summary, aid)
-        result["effort"] = _drop_none(_effort_rating(dto)) or None
-        result["cost"] = _drop_none(_session_cost(dto)) or None
-        result["terrain"] = _terrain(dto)
-
-        stored_zones = None
-        try:
-            stored_zones = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
-        except Exception as e:
-            errors["hr_zones"] = str(e)
-        # Recompute against the live zone model. Kept beside the stored numbers,
-        # never on top of them: the comparison is what shows the correction
-        # landed, and overwriting would hide a bad zone config.
-        model, model_error = _hr_zone_model(lthr or None)
-        recomputed = (
-            _recompute_hr_zones(aid, model, stored_zones) if model
-            else {"not_recomputable": model_error}
-        )
-        if stored_zones:
-            stored_zones["recomputed"] = recomputed
-            result["hr_zones"] = stored_zones
-        else:
-            result["hr_zones"] = {"recomputed": recomputed}
-        try:
-            result["power_zones"] = _zone_distribution(
-                garmin_client.get_activity_power_in_timezones(aid), boundary_key="low_w"
-            )
-        except Exception as e:
-            errors["power_zones"] = str(e)
-        if "strength" in (result["session"].get("type") or ""):
+        def run():
+            result = {}
+            errors = {}
             try:
-                result["strength_sets"] = _summarize_exercise_sets(
-                    garmin_client.get_activity_exercise_sets(aid)
+                summary, aid, note, others = _resolve_activity(activity_id, date)
+                if note:
+                    return {"note": note}
+                result["session"] = _drop_none(_summarize_session(summary))
+                result["activity_id"] = aid
+                if others:
+                    result["other_activities_that_day"] = others
+            except Exception as e:
+                return {"error": str(e)}
+
+            form = _form_metrics(summary)
+            result["form"] = _drop_none({
+                "cadence_spm": form["cadence_spm"],
+                "stride_length_m": form["stride_length_m"],
+            }) or None
+
+            dto = _full_activity(summary, aid)
+            result["effort"] = _drop_none(_effort_rating(dto)) or None
+            result["cost"] = _drop_none(_session_cost(dto)) or None
+            result["terrain"] = _terrain(dto)
+
+            rows, stream_error = _activity_stream(aid)
+            samples = [(r["t"], r["hr"]) for r in rows] if rows else None
+            if easy_ceiling_bpm:
+                result["hr_ceiling"] = (
+                    _ceiling_share(samples, easy_ceiling_bpm) if samples else None
+                ) or {"not_recomputable": stream_error or "no HR time recorded"}
+
+            stored_zones = None
+            try:
+                stored_zones = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
+            except Exception as e:
+                errors["hr_zones"] = str(e)
+            # Recompute against the live zone model. Kept beside the stored
+            # numbers, never on top of them: the comparison is what shows the
+            # correction landed, and overwriting would hide a bad zone config.
+            model, model_error = _hr_zone_model(
+                lthr or None, _zone_sport(result["session"].get("type"))
+            )
+            if not model:
+                recomputed = {"not_recomputable": model_error}
+            elif samples is None:
+                recomputed = {"not_recomputable": stream_error}
+            else:
+                recomputed = _recompute_hr_zones(aid, model, stored_zones, samples=samples)
+            if stored_zones:
+                stored_zones["recomputed"] = recomputed
+                result["hr_zones"] = stored_zones
+            else:
+                result["hr_zones"] = {"recomputed": recomputed}
+
+            if threshold_test:
+                garmin_lthr = model and (model.get("lthr_configured") or model.get("lthr"))
+                result["threshold_test"] = (
+                    _threshold_test(rows, garmin_lthr=garmin_lthr) if rows
+                    else {"not_applicable": stream_error}
+                )
+
+            try:
+                result["power_zones"] = _zone_distribution(
+                    garmin_client.get_activity_power_in_timezones(aid), boundary_key="low_w"
                 )
             except Exception as e:
-                errors["strength_sets"] = str(e)
-        try:
-            result["pacing"] = _pacing(_lap_form_rows(garmin_client.get_activity_splits(aid)))
-        except Exception as e:
-            errors["pacing"] = str(e)
-        try:
-            w = garmin_client.get_activity_weather(aid)
-            w = w if isinstance(w, dict) else {}
-            temp_c = round((w["temp"] - 32) * 5 / 9) if isinstance(w.get("temp"), (int, float)) else None
-            result["weather"] = _drop_none({
-                "temp_c": temp_c,
-                "humidity_pct": w.get("relativeHumidity"),
-                # heat inflates HR — flag so a warm run isn't misread as too-hard
-                "heat_note": "warm — HR runs higher, discount the zone read" if isinstance(temp_c, (int, float)) and temp_c >= 22 else None,
-            }) or None
-        except Exception as e:
-            errors["weather"] = str(e)
+                errors["power_zones"] = str(e)
+            if "strength" in (result["session"].get("type") or ""):
+                try:
+                    result["strength_sets"] = _summarize_exercise_sets(
+                        garmin_client.get_activity_exercise_sets(aid)
+                    )
+                except Exception as e:
+                    errors["strength_sets"] = str(e)
+            try:
+                result["pacing"] = _pacing(_lap_form_rows(garmin_client.get_activity_splits(aid)))
+            except Exception as e:
+                errors["pacing"] = str(e)
+            try:
+                w = garmin_client.get_activity_weather(aid)
+                w = w if isinstance(w, dict) else {}
+                temp_c = round((w["temp"] - 32) * 5 / 9) if isinstance(w.get("temp"), (int, float)) else None
+                result["weather"] = _drop_none({
+                    "temp_c": temp_c,
+                    "humidity_pct": w.get("relativeHumidity"),
+                    # heat inflates HR — flag so a warm run isn't misread as too-hard
+                    "heat_note": "warm — HR runs higher, discount the zone read" if isinstance(temp_c, (int, float)) and temp_c >= 22 else None,
+                }) or None
+            except Exception as e:
+                errors["weather"] = str(e)
 
-        if errors:
-            result["errors"] = errors
-        return json.dumps(_drop_none(result), indent=2)
+            if errors:
+                result["errors"] = errors
+            return _drop_none(result)
+
+        return json.dumps(await asyncio.to_thread(run), indent=2)
 
     @app.tool()
     async def get_running_dynamics(activity_id: int = 0, date: str = "") -> str:
@@ -1284,11 +1726,13 @@ def register_tools(app):
         result = {}
         errors = {}
         try:
-            summary, aid, note = _resolve_activity(activity_id, date)
+            summary, aid, note, others = _resolve_activity(activity_id, date)
             if note:
                 return json.dumps({"note": note}, indent=2)
             result["session"] = _drop_none(_summarize_session(summary))
             result["activity_id"] = aid
+            if others:
+                result["other_activities_that_day"] = others
         except Exception as e:
             return json.dumps({"error": str(e)}, indent=2)
 
@@ -1328,134 +1772,173 @@ def register_tools(app):
         activity_type: str = "running",
         lthr: int = 0,
         recompute_zones: bool = True,
+        easy_ceiling_bpm: int = 0,
     ) -> str:
         """Execution quality ACROSS the last N sessions of one type — surfaces
         patterns a single-session view misses: how many runs were genuinely
-        easy (Z1-2) vs 'grey zone' (mostly Z3) vs hard (Z3+ heavy), the average
-        easy-share, per-run cadence + stride length (form drift across weeks),
-        per-run power easy-share and the athlete's own RPE (perception vs
-        objective effort — the calibration gap), and monotony (are they all
-        the same distance/effort?). Use
+        easy vs 'grey zone' vs hard, the average easy-share, per-run cadence +
+        stride length (form drift across weeks), per-run power easy-share and
+        the athlete's own RPE (perception vs objective effort — the
+        calibration gap), and monotony (are they all the same distance?). Use
         for weekly review and to diagnose training distribution (e.g. the
         classic 'every run is moderately hard' base-building failure).
 
-        Easy-share is recomputed from each session's raw HR stream against the
-        CURRENT zone model by default. Garmin freezes zone times into an
-        activity at upload, so a stored series spanning a zone-model change is
-        a broken prefix joined to a clean suffix and must never be averaged
-        across — recomputing puts every session on one model, which is what
-        makes the average and the trend mean anything. `easy_share_basis` says
-        which basis was used, `zone_model` names the thresholds applied, and
-        sessions whose stream is missing are reported in `not_recomputable`
-        and excluded from the average rather than silently mixed in.
+        With `easy_ceiling_bpm` (the plan's HR cap) each run gets
+        `under_ceiling_pct` — time at or under the cap from the raw stream —
+        and the easy/grey/hard grading uses it (`execution_basis` says so).
+        That grading does not depend on Garmin's zone model at all.
+
+        Zone easy-share is recomputed from each session's raw HR stream
+        against the CURRENT zone model for the sport by default, because
+        Garmin freezes zone times into an activity at upload and a stored
+        series spanning a zone-model change must never be averaged across.
+        `zone_model` names the model applied, including `floors_basis` and any
+        `method_mismatch`; `zone_model_stamps` groups sessions by the bands
+        they were stamped with; sessions with no stream are listed in
+        `not_recomputable` and left out of the average.
 
         Args:
-            count: number of recent sessions to analyse (default 10, ~2N API
-                calls, ~3N with recompute_zones)
+            count: number of recent sessions to analyse (default 10; ~3 API
+                calls per session, four in flight)
             activity_type: typeKey filter, e.g. running / cycling (default running)
-            lthr: override the lactate-threshold HR the zone model is anchored
-                to (optional; default reads Garmin's live zone configuration)
-            recompute_zones: recompute time-in-zone from raw HR (default True).
-                Set False for Garmin's stored per-activity zone times, which
-                are cheaper but not comparable across a zone-model change.
+            lthr: score zones on %LTHR bands built from this threshold instead
+                of Garmin's live config (optional)
+            recompute_zones: recompute zone time from raw HR (default True).
+                False uses Garmin's stored per-activity zone times — cheaper,
+                not comparable across a zone-model change
+            easy_ceiling_bpm: the coaching plan's easy HR cap (optional)
         """
-        try:
-            acts = garmin_client.get_activities(0, max(1, min(count * 2, 40))) or []
-        except Exception as e:
-            return json.dumps({"error": str(e)}, indent=2)
-        acts = [a for a in acts if isinstance(a, dict)
-                and (a.get("activityType") or {}).get("typeKey", "").find(activity_type) >= 0][:count]
-
-        # One zone-config fetch for the whole batch — the model is per-athlete,
-        # not per-activity.
-        model, model_error = (None, "recompute_zones=False")
-        if recompute_zones:
-            model, model_error = _hr_zone_model(lthr or None)
-
-        runs = []
-        stamps = []
-        not_recomputable = {}
-        buckets = {"easy": 0, "grey": 0, "hard": 0, "unknown": 0}
-        for a in acts:
-            aid = a.get("activityId")
-            dist = a.get("distance")
-            form = _form_metrics(a)
-            row = {
-                "date": (a.get("startTimeLocal") or "")[:10],
-                "km": round(dist / 1000, 1) if isinstance(dist, (int, float)) else None,
-                "avg_hr": a.get("averageHR"),
-                "cadence_spm": form["cadence_spm"],
-                "stride_length_m": form["stride_length_m"],
-                "power_easy_share_pct": _power_share_from_list(a),
-                "aerobic_te": round(a["aerobicTrainingEffect"], 1) if isinstance(a.get("aerobicTrainingEffect"), (int, float)) else None,
-            }
+        def run():
+            scan = max(20, min(count * 4, 100))
             try:
-                row["rpe_10"] = _effort_rating(garmin_client.get_activity(aid) or {})["rpe_10"]
-            except Exception:
-                pass
-            try:
-                z = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
-                row["easy_share_pct"] = z["easy_share_pct"] if z else None
-                # The bands this session was stamped with, for the drift report.
-                stamps.append((row["date"], _stored_floors(z)))
-            except Exception:
-                pass
-            # The graded share: recomputed when we can, stored otherwise, but
-            # never a mix — a single basis is the whole point of the series.
-            if model:
-                rec = _recompute_hr_zones(
-                    aid, model, max_samples=_HR_STREAM_SAMPLES_TREND
-                )
-                if "not_recomputable" in rec:
-                    not_recomputable[str(aid)] = rec["not_recomputable"]
-                    graded_share = None
+                acts = garmin_client.get_activities(0, scan) or []
+            except Exception as e:
+                return {"error": str(e)}
+            acts = [a for a in acts if isinstance(a, dict)
+                    and activity_type in (((a.get("activityType") or {}).get("typeKey")) or "")]
+            found = len(acts)
+            acts = acts[:count]
+
+            # One zone-config fetch for the whole batch — the model is
+            # per-athlete and per-sport, not per-activity.
+            model, model_error = (None, "recompute_zones=False")
+            if recompute_zones:
+                model, model_error = _hr_zone_model(lthr or None, _zone_sport(activity_type))
+
+            def one(a):
+                aid = a.get("activityId")
+                dist = a.get("distance")
+                form = _form_metrics(a)
+                row = {
+                    "date": (a.get("startTimeLocal") or "")[:10],
+                    "km": round(dist / 1000, 1) if isinstance(dist, (int, float)) else None,
+                    "avg_hr": a.get("averageHR"),
+                    "cadence_spm": form["cadence_spm"],
+                    "stride_length_m": form["stride_length_m"],
+                    "power_easy_share_pct": _power_share_from_list(a),
+                    "aerobic_te": round(a["aerobicTrainingEffect"], 1) if isinstance(a.get("aerobicTrainingEffect"), (int, float)) else None,
+                }
+                try:
+                    row["rpe_10"] = _effort_rating(garmin_client.get_activity(aid) or {})["rpe_10"]
+                except Exception:
+                    pass
+                stamp = None
+                try:
+                    z = _zone_distribution(garmin_client.get_activity_hr_in_timezones(aid))
+                    row["easy_share_pct"] = z["easy_share_pct"] if z else None
+                    # The bands this session was stamped with, for the drift report.
+                    stamp = (row["date"], _stored_floors(z))
+                except Exception:
+                    pass
+                samples, reason = (None, None)
+                if model or easy_ceiling_bpm:
+                    samples, reason = _hr_stream(aid, _HR_STREAM_SAMPLES_TREND)
+                # The graded zone share: recomputed when we can, stored
+                # otherwise, but never a mix — one basis is the point.
+                if model:
+                    zone_share = None
+                    if samples is not None:
+                        rec = _recompute_hr_zones(aid, model, samples=samples)
+                        if "not_recomputable" in rec:
+                            reason = rec["not_recomputable"]
+                        else:
+                            zone_share = rec["easy_share_pct"]
+                            row["easy_share_recomputed_pct"] = zone_share
                 else:
-                    graded_share = rec["easy_share_pct"]
-                    row["easy_share_recomputed_pct"] = graded_share
-            else:
-                graded_share = row.get("easy_share_pct")
-            tag = ("unknown" if graded_share is None
-                   else "easy" if graded_share >= 65
-                   else "hard" if graded_share < 35 else "grey")
-            row["execution"] = tag
-            buckets[tag] += 1
-            runs.append(_drop_none(row))
-        share_key = "easy_share_recomputed_pct" if model else "easy_share_pct"
-        graded = [r for r in runs if r.get(share_key) is not None]
-        avg_easy = round(fmean(r[share_key] for r in graded)) if graded else None
-        dists = [r["km"] for r in runs if r.get("km")]
-        return json.dumps(_drop_none({
-            "analysed": len(runs),
-            "activity_type": activity_type,
-            "distribution": buckets,
-            "avg_easy_share_pct": avg_easy,
-            "easy_share_basis": (
-                "recomputed from raw HR against the current zone model"
-                if model else
-                f"Garmin's stored per-activity zone times ({model_error}) — "
-                "NOT comparable across a zone-model change"
-            ),
-            "zone_model": model and _drop_none({
-                "lthr": model.get("lthr"),
-                "lthr_source": model.get("lthr_source"),
-                "training_method": model.get("training_method"),
-                "floors_bpm": model.get("floors_bpm"),
-            }),
-            "not_recomputable": not_recomputable or None,
-            # A zone-model change is a step, invisible in any one activity.
-            # Listed here it names the date it happened and how many sessions
-            # still carry the old bands — the thing that silently broke this
-            # KPI before the recompute existed.
-            "zone_model_stamps": _stamp_history(
-                stamps, model["floors"] if model else None
-            ),
-            "power_model": _power_model_drift(acts),
-            "monotony": _drop_none({
-                "distinct_distances": len(set(dists)) if dists else None,
-                "distance_range_km": [min(dists), max(dists)] if dists else None,
-            }),
-            "sessions": runs,
-        }), indent=2)
+                    zone_share = row.get("easy_share_pct")
+                if easy_ceiling_bpm and samples is not None:
+                    c = _ceiling_share(samples, easy_ceiling_bpm)
+                    row["under_ceiling_pct"] = c["under_pct"] if c else None
+                graded = row.get("under_ceiling_pct") if easy_ceiling_bpm else zone_share
+                row["execution"] = ("unknown" if graded is None
+                                    else "easy" if graded >= 65
+                                    else "hard" if graded < 35 else "grey")
+                failed = None
+                if model and "easy_share_recomputed_pct" not in row:
+                    failed = reason
+                elif easy_ceiling_bpm and samples is None:
+                    failed = reason
+                return _drop_none(row), stamp, (str(aid), failed) if failed else None
+
+            with ThreadPoolExecutor(max_workers=_TREND_WORKERS) as pool:
+                results = list(pool.map(one, acts))
+
+            runs = [r for r, _, _ in results]
+            stamps = [s for _, s, _ in results if s]
+            not_recomputable = dict(f for _, _, f in results if f)
+            buckets = {"easy": 0, "grey": 0, "hard": 0, "unknown": 0}
+            for r in runs:
+                buckets[r["execution"]] += 1
+            share_key = "easy_share_recomputed_pct" if model else "easy_share_pct"
+            graded = [r for r in runs if r.get(share_key) is not None]
+            avg_easy = round(fmean(r[share_key] for r in graded)) if graded else None
+            dists = [r["km"] for r in runs if r.get("km")]
+            ceiling = None
+            if easy_ceiling_bpm:
+                under = [r["under_ceiling_pct"] for r in runs if r.get("under_ceiling_pct") is not None]
+                with_hr = [r for r in runs if isinstance(r.get("avg_hr"), (int, float))]
+                ceiling = _drop_none({
+                    "bpm": easy_ceiling_bpm,
+                    "runs_avg_hr_at_or_under": f"{sum(1 for r in with_hr if r['avg_hr'] <= easy_ceiling_bpm)} of {len(with_hr)}",
+                    "avg_under_pct": round(fmean(under)) if under else None,
+                })
+            return _drop_none({
+                "analysed": len(runs),
+                "note": (
+                    f"only {found} {activity_type} sessions among the last {scan} activities"
+                    if found < count else None
+                ),
+                "activity_type": activity_type,
+                "distribution": buckets,
+                "execution_basis": (
+                    f"time at or under {easy_ceiling_bpm} bpm (the plan's cap)"
+                    if easy_ceiling_bpm else "zone easy-share (Z1-2)"
+                ),
+                "ceiling": ceiling,
+                "avg_easy_share_pct": avg_easy,
+                "easy_share_basis": (
+                    "recomputed from raw HR against the current zone model"
+                    if model else
+                    f"Garmin's stored per-activity zone times ({model_error}) — "
+                    "NOT comparable across a zone-model change"
+                ),
+                "zone_model": model and _model_summary(model),
+                "not_recomputable": not_recomputable or None,
+                # A zone-model change is a step, invisible in any one activity.
+                # Listed here it names the date it happened and how many
+                # sessions still carry the old bands.
+                "zone_model_stamps": _stamp_history(
+                    stamps, model["floors"] if model else None
+                ),
+                "power_model": _power_model_drift(acts),
+                "monotony": _drop_none({
+                    "distinct_distances": len(set(dists)) if dists else None,
+                    "distance_range_km": [min(dists), max(dists)] if dists else None,
+                }),
+                "sessions": runs,
+            })
+
+        return json.dumps(await asyncio.to_thread(run), indent=2)
 
     @app.tool()
     async def get_energy_curve(date: str) -> str:
@@ -1470,18 +1953,14 @@ def register_tools(app):
         """
         out = {"date": date}
         errors = {}
-        offset_h = 0
-        try:
-            events = garmin_client.get_body_battery_events(date) or []
-            for e in events:
-                off = (e.get("event") or {}).get("timezoneOffset")
-                if isinstance(off, (int, float)):
-                    offset_h = off / 3600000
-                    break
-        except Exception:
-            pass
         try:
             bb = next((d for d in (garmin_client.get_body_battery(date, date) or []) if isinstance(d, dict)), {})
+            offset_h = _utc_offset_hours(bb)
+            if offset_h is None:
+                offset_h = _utc_offset_from_events(date)
+            if offset_h is None:
+                offset_h = 0
+                out["timezone_note"] = "UTC offset unknown for this day — hours are UTC"
             idx = _descriptor_index(bb.get("bodyBatteryValueDescriptorDTOList"), "bodyBatteryLevel", 2)
             hourly = {}
             for row in bb.get("bodyBatteryValuesArray") or []:
@@ -1491,12 +1970,10 @@ def register_tools(app):
             curve = [{"hour": h, "level": round(fmean(v))} for h, v in sorted(hourly.items())]
             out["current_level"] = _current_body_battery_level(bb)
             out["hourly"] = curve
-            # best/worst 2-hour window
-            if len(curve) >= 2:
-                best = max(curve, key=lambda c: c["level"])
-                worst = min(curve, key=lambda c: c["level"])
-                out["peak_window"] = {"around_hour": best["hour"], "level": best["level"]}
-                out["trough_window"] = {"around_hour": worst["hour"], "level": worst["level"]}
+            peak, trough = _energy_windows(curve)
+            if peak:
+                out["peak_window"] = peak
+                out["trough_window"] = trough
         except Exception as e:
             errors["body_battery"] = str(e)
         try:
@@ -1607,8 +2084,16 @@ def register_tools(app):
         except Exception as e:
             errors["prs"] = str(e)
         try:
-            badges = garmin_client.get_earned_badges() or []
-            out["recent_badges"] = [b.get("badgeName") for b in badges[:5] if isinstance(b, dict)]
+            badges = [
+                b for b in garmin_client.get_earned_badges() or []
+                if isinstance(b, dict)
+                and (b.get("badgeEarnedDate") or "")[:10] >= cutoff.isoformat()
+            ]
+            badges.sort(key=lambda b: b.get("badgeEarnedDate") or "", reverse=True)
+            out["recent_badges"] = [
+                _drop_none({"name": b.get("badgeName"), "date": (b.get("badgeEarnedDate") or "")[:10] or None})
+                for b in badges[:10]
+            ]
         except Exception as e:
             errors["badges"] = str(e)
         try:
@@ -1622,31 +2107,36 @@ def register_tools(app):
 
     @app.tool()
     async def get_plan_context() -> str:
-        """What structured training is prescribed/available: active Garmin plans
-        (if any), upcoming scheduled workouts, and the athlete's saved workout
-        library (name + id + type — real sessions that sync to the watch). Use
-        so the coach prescribes from real available workouts and reconciles any
-        active Garmin plan; if no active plan, the coach owns the periodization
-        itself (see plan.md)."""
+        """What structured training is prescribed/available: the athlete's
+        enrolled Garmin plans that are not completed (status, dates, days to
+        the race, current week), and for an adaptive Garmin Coach plan its
+        phases and the ~7 days of sessions Garmin has generated; plus the saved
+        workout library (name + id + type — real sessions that sync to the
+        watch). Use so the coach prescribes from real available workouts and
+        reconciles any enrolled Garmin plan; if none, the coach owns the
+        periodization itself (see plan.md). The calendar itself comes from
+        get_scheduled_workouts."""
         out = {}
         errors = {}
         try:
             plans = (garmin_client.get_training_plans() or {}).get("trainingPlanList", [])
-            active = [
-                _drop_none({
-                    "id": p.get("trainingPlanId"),
-                    "name": p.get("name"),
-                    "category": p.get("trainingPlanCategory"),
-                    "status": (p.get("trainingStatus") or {}).get("statusKey"),
-                    "weeks": p.get("durationInWeeks"),
-                    "avg_weekly_workouts": p.get("avgWeeklyWorkouts"),
-                })
-                for p in plans if isinstance(p, dict)
-            ]
-            out["active_plans"] = [p for p in active if p.get("status") not in ("Completed", "Cancelled")]
-            out["all_plans_count"] = len(active)
+            today = datetime.date.today()
+            summarised = [_plan_summary(p, today) for p in plans if isinstance(p, dict)]
+            out["active_plans"] = [p for p in summarised if p.get("status") not in ("Completed", "Cancelled")]
+            out["all_plans_count"] = len(summarised)
             if not out["active_plans"]:
                 out["note"] = "no active Garmin plan — the coach owns periodization (plan.md)"
+            elif any(p.get("adaptive") for p in out["active_plans"]):
+                out["note"] = (
+                    "an adaptive Garmin plan is enrolled: it puts its own workouts on the "
+                    "watch calendar — reconcile them with the coach's cards"
+                )
+                for p in out["active_plans"]:
+                    if p.get("adaptive"):
+                        try:
+                            p.update(_adaptive_plan_detail(p["id"], today))
+                        except Exception as e:
+                            errors[f"plan_{p['id']}"] = str(e)
         except Exception as e:
             errors["plans"] = str(e)
         try:

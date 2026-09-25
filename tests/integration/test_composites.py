@@ -272,7 +272,8 @@ async def test_coach_report_degrades_on_section_failure(app_with_composites, moc
     mock_garmin_client.get_max_metrics.return_value = [{"generic": {"vo2MaxValue": 52.0}}]
     result = await app_with_composites.call_tool("get_coach_report", {"end_date": "2026-07-02"})
     data = json.loads(result[0][0].text)
-    assert data["errors"]["fitness"] == "500"
+    assert data["errors"]["endurance_score"] == "500"
+    assert data["fitness"]["vo2max_now"] == 52.0  # one failed call no longer takes VO2 down with it
     assert data["readiness"]["score"] == 84  # rest still present
 
 
@@ -399,8 +400,8 @@ async def test_energy_curve_finds_peak_and_trough(app_with_composites, mock_garm
     mock_garmin_client.get_training_readiness.return_value = [{"score": 70, "level": "MODERATE"}]
     result = await app_with_composites.call_tool("get_energy_curve", {"date": "2026-07-04"})
     data = json.loads(result[0][0].text)
-    assert data["peak_window"]["around_hour"] == 1
-    assert data["trough_window"]["around_hour"] == 10
+    assert data["peak_window"]["from_hour"] == 1
+    assert data["trough_window"]["from_hour"] == 10
     assert data["readiness"]["score"] == 70
 
 
@@ -744,7 +745,8 @@ async def test_session_analysis_recompute_names_the_applied_lthr_override(
     assert applied["lthr"] == 190
     assert applied["lthr_configured"] == 170
     assert applied["lthr_source"] == "caller_override"
-    assert applied["floors_bpm"]["z2"] == 145      # 130 * 190/170
+    assert applied["floors_bpm"]["z2"] == 150      # 190 * 0.79 — Garmin's %LTHR ratio
+    assert applied["floors_basis"] == "pct_lthr"
 
 
 @pytest.mark.asyncio
