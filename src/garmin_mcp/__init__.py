@@ -41,6 +41,7 @@ from garmin_mcp.tool_annotations import annotations_for
 from garmin_mcp.tool_profiles import resolve_tool_profile
 from garmin_mcp.write_errors import _upstream
 from garmin_mcp import composites
+from garmin_mcp import strength
 
 
 def is_interactive_terminal() -> bool:
@@ -151,6 +152,8 @@ _COACHING_PROFILE = frozenset({
     "get_health_flags", "get_plan_context", "get_running_dynamics",
     "get_session_analysis", "get_training_week", "get_wellness_brief",
     "get_wins",
+    # strength
+    "get_strength_progression",
     # health_wellness
     "get_all_day_stress", "get_body_battery", "get_daily_steps",
     "get_heart_rates", "get_heart_rates_summary", "get_sleep_data",
@@ -933,6 +936,7 @@ def main():
     activity_analysis.configure(garmin_client)
     calendar_events.configure(garmin_client)
     composites.configure(garmin_client)
+    strength.configure(garmin_client)
 
     # Create the MCP app, wrapped so the env-var filter can drop tools.
     # host/port only matter for the HTTP transports; stdio ignores them.
@@ -989,6 +993,7 @@ def main():
     app = activity_analysis.register_tools(app)
     app = calendar_events.register_tools(app)
     app = composites.register_tools(app)
+    app = strength.register_tools(app)
 
     # Register resources (workout templates)
     app = workout_templates.register_resources(app)
