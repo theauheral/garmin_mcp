@@ -171,7 +171,8 @@ _COACHING_PROFILE = frozenset({
     "add_weigh_in", "get_weigh_ins",
     # workouts
     "delete_workout", "get_scheduled_workouts", "get_workout_by_id",
-    "get_workouts", "schedule_workout", "schedule_workouts",
+    "get_workouts", "reschedule_workout", "schedule_workout",
+    "schedule_workouts",
     "unschedule_workout", "upload_workout", "upload_workouts",
 })
 
