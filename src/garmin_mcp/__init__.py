@@ -147,6 +147,8 @@ _COACHING_PROFILE = frozenset({
     "set_perceived_effort",
     # challenges
     "get_personal_record", "get_race_predictions",
+    # calendar_events
+    "get_calendar_events",
     # composites
     "get_coach_report", "get_energy_curve", "get_execution_trend",
     "get_health_flags", "get_plan_context", "get_running_dynamics",
@@ -162,7 +164,8 @@ _COACHING_PROFILE = frozenset({
     "get_weekly_intensity_minutes",
     # training
     "get_endurance_score", "get_hrv_data", "get_hrv_trend",
-    "get_progress_summary_between_dates", "get_respiration_trend",
+    "get_lactate_threshold", "get_progress_summary_between_dates",
+    "get_respiration_trend",
     "get_training_load_balance", "get_training_load_trend",
     "get_training_status", "get_vo2max_trend", "request_reload",
     # user_profile
