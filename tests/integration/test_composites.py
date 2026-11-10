@@ -646,6 +646,71 @@ async def test_execution_trend_rows_carry_form_power_and_rpe(app_with_composites
     assert row["easy_share_pct"] == 30
 
 
+def _local_ms(iso, hour, minute=0):
+    import datetime
+    d = datetime.date.fromisoformat(iso)
+    return datetime.datetime.combine(d, datetime.time(hour, minute), datetime.timezone.utc).timestamp() * 1000
+
+
+@pytest.mark.asyncio
+async def test_sleep_regularity_scores_the_window_and_lists_missing_nights(
+    app_with_composites, mock_garmin_client
+):
+    import datetime
+    end = datetime.date(2026, 11, 8)           # a Sunday wake-up date
+
+    def sleep_for(date):
+        d = datetime.date.fromisoformat(date)
+        if date == "2026-11-03":               # no sleep window recorded
+            return {"dailySleepDTO": {}}
+        prev = (d - datetime.timedelta(days=1)).isoformat()
+        late = d.weekday() >= 5                # Sat/Sun wake-ups: bed 01:00, wake 09:00
+        return {"dailySleepDTO": {
+            "sleepStartTimestampLocal": _local_ms(date, 1) if late else _local_ms(prev, 23),
+            "sleepEndTimestampLocal": _local_ms(date, 9 if late else 7),
+        }}
+    mock_garmin_client.get_sleep_data.side_effect = sleep_for
+
+    result = await app_with_composites.call_tool(
+        "get_sleep_regularity", {"end_date": "2026-11-08", "days": 14})
+    data = json.loads(result[0][0].text)
+
+    assert data["window"] == {"start": "2026-10-26", "end": "2026-11-08"}
+    assert data["nights_used"] == 13
+    assert data["missing_nights"] == ["2026-11-03"]
+    assert data["social_jet_lag"]["flag"] is True
+    assert data["social_jet_lag"]["shift_h"] == 2.0
+    assert 0 < data["sleep_regularity_index"] < 100
+    assert any("social jet lag" in r for r in data["read"])
+
+
+@pytest.mark.asyncio
+async def test_sleep_regularity_says_so_when_there_are_too_few_nights(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_sleep_data.return_value = {}
+    result = await app_with_composites.call_tool(
+        "get_sleep_regularity", {"end_date": "2026-11-08"})
+    data = json.loads(result[0][0].text)
+
+    assert "need 5+" in data["note"]
+    assert "sleep_regularity_index" not in data
+    assert len(data["missing_nights"]) == 14
+
+
+@pytest.mark.asyncio
+async def test_sleep_regularity_clamps_days_and_reports_failed_nights(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_sleep_data.side_effect = RuntimeError("503")
+    result = await app_with_composites.call_tool(
+        "get_sleep_regularity", {"end_date": "2026-11-08", "days": 400})
+    data = json.loads(result[0][0].text)
+
+    assert data["nights_requested"] == 30
+    assert len(data["errors"]) == 30
+
+
 @pytest.mark.asyncio
 async def test_health_flags_unknown_when_unsynced(app_with_composites, mock_garmin_client):
     mock_garmin_client.get_heart_rates.return_value = {}

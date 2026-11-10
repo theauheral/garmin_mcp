@@ -152,8 +152,8 @@ _COACHING_PROFILE = frozenset({
     # composites
     "get_coach_report", "get_energy_curve", "get_execution_trend",
     "get_health_flags", "get_plan_context", "get_running_dynamics",
-    "get_session_analysis", "get_training_week", "get_wellness_brief",
-    "get_wins",
+    "get_session_analysis", "get_sleep_regularity", "get_training_week",
+    "get_wellness_brief", "get_wins",
     # strength
     "get_strength_progression",
     # health_wellness

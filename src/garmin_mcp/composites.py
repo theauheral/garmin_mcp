@@ -891,6 +891,126 @@ def _aerobic_decoupling(rows):
     }
 
 
+# Sleep regularity. A night belongs to its WAKE-UP date (that is how Garmin keys
+# it). Times are the watch's own local wall-clock (the *Local timestamps, which
+# are local time encoded as if it were UTC), so a trip across a timezone does
+# not read as a shifted night.
+_SLEEP_MIN_NIGHTS = 5            # fewer than this and spread/regularity are noise
+_SLEEP_EVENING_ORIGIN_MIN = 18 * 60   # bedtimes are measured from 18:00 so 23:30 and 01:00 do not straddle midnight
+_SOCIAL_JET_LAG_H = 1.0          # Wittmann et al. 2006's usual flag for a work/free-day shift
+
+
+def _clock_min(ms):
+    """Minutes since local midnight for a local-wall-clock ms timestamp."""
+    t = datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc)
+    return t.hour * 60 + t.minute + t.second / 60
+
+
+def _sleep_day(ms):
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).date()
+
+
+def _sd(values):
+    if len(values) < 3:
+        return None
+    m = sum(values) / len(values)
+    return (sum((v - m) ** 2 for v in values) / (len(values) - 1)) ** 0.5
+
+
+def _hhmm(minutes):
+    m = round(minutes) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _sleep_regularity(nights):
+    """Timing regularity from nights of {date, start_ms, end_ms} (local clock).
+
+    - Bedtime / wake / midpoint spread (SD, minutes).
+    - Social jet lag: weekend-night midpoint minus weekday-night midpoint
+      (Wittmann 2006). A night's weekday is its wake-up date's.
+    - Sleep Regularity Index (Phillips 2017): the chance of being in the same
+      sleep/wake state 24 hours apart, 100 = identical every day, 0 = random.
+      Computed from the sleep window of each pair of consecutive nights (naps
+      and mid-night wakings are not in the window), so it is the onset/offset
+      version of the index, not the minute-by-minute one.
+    Returns None under _SLEEP_MIN_NIGHTS usable nights.
+    """
+    rows = []
+    for n in nights:
+        s, e = n.get("start_ms"), n.get("end_ms")
+        if not isinstance(s, (int, float)) or not isinstance(e, (int, float)) or e <= s:
+            continue
+        bed = (_clock_min(s) - _SLEEP_EVENING_ORIGIN_MIN) % 1440   # minutes after 18:00
+        wake = _clock_min(e)
+        rows.append({
+            "date": n["date"], "start_ms": s, "end_ms": e, "bed": bed, "wake": wake,
+            "mid": (bed + (e - s) / 120000) % 1440,                # (e-s)/2 in minutes
+            "hours": (e - s) / 3600000,
+            "weekend": datetime.date.fromisoformat(n["date"]).weekday() >= 5,
+        })
+    rows.sort(key=lambda r: r["date"])
+    if len(rows) < _SLEEP_MIN_NIGHTS:
+        return None
+
+    def clock(minutes_after_evening):
+        return _hhmm(minutes_after_evening + _SLEEP_EVENING_ORIGIN_MIN)
+
+    out = {
+        "nights_used": len(rows),
+        "avg_bedtime": clock(fmean(r["bed"] for r in rows)),
+        "avg_wake": _hhmm(fmean(r["wake"] for r in rows)),
+        "avg_midpoint": clock(fmean(r["mid"] for r in rows)),
+        "avg_sleep_h": _round(fmean(r["hours"] for r in rows), 2),
+        "bedtime_sd_min": _round(_sd([r["bed"] for r in rows]), 0),
+        "wake_sd_min": _round(_sd([r["wake"] for r in rows]), 0),
+        "midpoint_sd_min": _round(_sd([r["mid"] for r in rows]), 0),
+    }
+
+    # Sleep Regularity Index over consecutive-date night pairs
+    by_date = {r["date"]: r for r in rows}
+    agree = []
+    for r in rows:
+        nxt = by_date.get((datetime.date.fromisoformat(r["date"]) + datetime.timedelta(days=1)).isoformat())
+        if not nxt:
+            continue
+
+        def window(night):
+            """The night as minutes inside its own noon-to-noon window, clipped to it."""
+            wake_day = _sleep_day(night["end_ms"])
+            noon0 = datetime.datetime.combine(wake_day - datetime.timedelta(days=1),
+                                              datetime.time(12), datetime.timezone.utc).timestamp() * 1000
+            a = min(1440.0, max(0.0, (night["start_ms"] - noon0) / 60000))
+            b = min(1440.0, max(0.0, (night["end_ms"] - noon0) / 60000))
+            return a, b
+
+        (a1, b1), (a2, b2) = window(r), window(nxt)
+        overlap = max(0.0, min(b1, b2) - max(a1, a2))
+        union = (b1 - a1) + (b2 - a2) - overlap
+        agree.append((overlap + (1440 - union)) / 1440)
+    if len(agree) >= 3:
+        out["sleep_regularity_index"] = _round(100 * (2 * fmean(agree) - 1), 1)
+        out["sri_pairs"] = len(agree)
+
+    wk = [r["mid"] for r in rows if not r["weekend"]]
+    we = [r["mid"] for r in rows if r["weekend"]]
+    if len(wk) >= 3 and len(we) >= 2:
+        diff_h = (fmean(we) - fmean(wk)) / 60
+        out["social_jet_lag"] = {
+            "weekday_midpoint": clock(fmean(wk)),
+            "weekend_midpoint": clock(fmean(we)),
+            "shift_h": _round(diff_h, 2),
+            "flag": abs(diff_h) > _SOCIAL_JET_LAG_H,
+            "weekday_nights": len(wk),
+            "weekend_nights": len(we),
+        }
+    out["nights"] = [
+        {"date": r["date"], "bed": clock(r["bed"]), "wake": _hhmm(r["wake"]),
+         "midpoint": clock(r["mid"]), "hours": _round(r["hours"], 2)}
+        for r in rows
+    ]
+    return out
+
+
 def _threshold_test(rows, effort_min=30, tail_min=20, garmin_lthr=None):
     """Read a 30-minute threshold field test out of one activity's stream.
 
@@ -2176,6 +2296,82 @@ def register_tools(app):
         if errors:
             result["errors"] = errors
         return json.dumps(result, indent=2)
+
+    @app.tool()
+    async def get_sleep_regularity(end_date: str, days: int = 14) -> str:
+        """Sleep TIMING consistency over the last N nights: how much bedtime,
+        wake time and mid-sleep move night to night, the weekday-vs-weekend
+        shift (social jet lag), and the Sleep Regularity Index. Duration and
+        score say how much and how well he slept; this says whether the clock
+        was steady, which has its own link to recovery and health.
+
+        Times are the watch's local wall-clock, so a trip across timezones is
+        not misread as a shifted night, and a night belongs to its wake-up
+        date. `sleep_regularity_index` (Phillips 2017) is the chance of being
+        in the same sleep/wake state 24 h apart: 100 = identical every day,
+        lower = less regular; it is the onset/offset version (naps and
+        mid-night wakings are not in it) and is only a read against his own
+        earlier fortnight, so compare calls rather than quote one. Rule of
+        thumb used for the reads: mid-sleep SD under ~30 min is tight, over
+        ~60 min is irregular; a weekend shift over 1 h (Wittmann 2006) is
+        social jet lag. Nights without a recorded sleep window are listed in
+        `missing_nights`; under 5 usable nights nothing is scored.
+
+        One Garmin request per night (4 in flight); the default 14 is about
+        14 calls.
+
+        Args:
+            end_date: YYYY-MM-DD, the last wake-up date (usually today)
+            days: nights to look back, 7-30 (default 14)
+        """
+        def run():
+            try:
+                end = datetime.date.fromisoformat(end_date)
+            except ValueError as e:
+                return {"error": f"Invalid date: {e}. Use YYYY-MM-DD."}
+            n_days = max(7, min(int(days), 30))
+            dates = [(end - datetime.timedelta(days=i)).isoformat() for i in range(n_days)]
+
+            def one(d):
+                try:
+                    dto = (garmin_client.get_sleep_data(d) or {}).get("dailySleepDTO") or {}
+                except Exception as e:
+                    return d, None, str(e)
+                s, e = dto.get("sleepStartTimestampLocal"), dto.get("sleepEndTimestampLocal")
+                if not isinstance(s, (int, float)) or not isinstance(e, (int, float)):
+                    return d, None, None
+                return d, {"date": _sleep_day(e).isoformat(), "start_ms": s, "end_ms": e}, None
+
+            with ThreadPoolExecutor(max_workers=_TREND_WORKERS) as pool:
+                results = list(pool.map(one, dates))
+            nights = [n for _, n, _ in results if n]
+            missing = sorted(d for d, n, _ in results if n is None)
+            errors = {d: err for d, n, err in results if err}
+            out = {"window": {"start": dates[-1], "end": dates[0]}, "nights_requested": n_days}
+            scored = _sleep_regularity(nights)
+            if scored is None:
+                out["note"] = (f"only {len(nights)} night(s) with a recorded sleep window — "
+                               f"need {_SLEEP_MIN_NIGHTS}+ to score regularity")
+            else:
+                out.update(scored)
+                reads = []
+                sd = scored.get("midpoint_sd_min")
+                if sd is not None:
+                    reads.append("mid-sleep varies by ~%d min night to night — %s" % (
+                        sd, "tight" if sd < 30 else "irregular" if sd > 60 else "moderate"))
+                sjl = scored.get("social_jet_lag")
+                if sjl:
+                    reads.append("weekend sleep sits %.1f h %s weekday sleep%s" % (
+                        abs(sjl["shift_h"]), "later than" if sjl["shift_h"] > 0 else "earlier than",
+                        " — social jet lag" if sjl["flag"] else ""))
+                out["read"] = reads
+            if missing:
+                out["missing_nights"] = missing
+            if errors:
+                out["errors"] = errors
+            return out
+
+        return json.dumps(await asyncio.to_thread(run), indent=2)
 
     @app.tool()
     async def get_wins(days: int = 14) -> str:
