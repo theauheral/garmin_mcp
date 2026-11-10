@@ -646,6 +646,24 @@ async def test_execution_trend_rows_carry_form_power_and_rpe(app_with_composites
     assert row["easy_share_pct"] == 30
 
 
+@pytest.mark.asyncio
+async def test_execution_trend_rows_carry_pace_and_efficiency(app_with_composites, mock_garmin_client):
+    # 7261 m in 2541 s = 2.857 m/s = 5:50/km; at 143 bpm that is 2.857/143*1000 = 20.0
+    item = {**RUN_LIST_ITEM, "averageSpeed": 2.857}
+    no_hr = {**RUN_LIST_ITEM, "activityId": 43, "averageSpeed": 2.857, "averageHR": None}
+    no_speed = {**RUN_LIST_ITEM, "activityId": 44}
+    mock_garmin_client.get_activities.return_value = [item, no_hr, no_speed]
+    mock_garmin_client.get_activity.return_value = RUN_ACTIVITY_WRAPPER
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = [{"zoneNumber": 2, "secsInZone": 600}]
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 3})
+    full, hr_missing, speed_missing = json.loads(result[0][0].text)["sessions"]
+
+    assert full["pace_min_per_km"] == 5.83
+    assert full["efficiency_factor"] == 20.0
+    assert hr_missing["pace_min_per_km"] == 5.83 and "efficiency_factor" not in hr_missing
+    assert "pace_min_per_km" not in speed_missing and "efficiency_factor" not in speed_missing
+
+
 def _local_ms(iso, hour, minute=0):
     import datetime
     d = datetime.date.fromisoformat(iso)

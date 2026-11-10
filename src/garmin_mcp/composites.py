@@ -2006,6 +2006,10 @@ def register_tools(app):
         and the easy/grey/hard grading uses it (`execution_basis` says so).
         That grading does not depend on Garmin's zone model at all.
 
+        Each run carries `pace_min_per_km` and `efficiency_factor` (speed in
+        m/s per bpm, x1000: the same fitness gives the same number at any easy
+        heart rate). Compare it only between runs of similar length and route.
+
         Each steady run also gets `decoupling_pct` (Pa:HR: second-half
         efficiency against the first; under 5% = durable aerobic engine) and
         the batch gets `aerobic_decoupling` (average, runs under 5%) — the
@@ -2062,6 +2066,15 @@ def register_tools(app):
                     "power_easy_share_pct": _power_share_from_list(a),
                     "aerobic_te": round(a["aerobicTrainingEffect"], 1) if isinstance(a.get("aerobicTrainingEffect"), (int, float)) else None,
                 }
+                # Pace and efficiency from the list item (no extra call). The factor
+                # is speed (m/s) per bpm x 1000, so the same fitness reads the same
+                # number at any easy HR: the trend that shows an aerobic base
+                # building, where raw pace moves with how hard the run was.
+                spd, hr = a.get("averageSpeed"), a.get("averageHR")
+                if isinstance(spd, (int, float)) and spd > 0:
+                    row["pace_min_per_km"] = round(1000 / spd / 60, 2)
+                    if isinstance(hr, (int, float)) and hr > 0:
+                        row["efficiency_factor"] = round(spd / hr * 1000, 1)
                 try:
                     row["rpe_10"] = _effort_rating(garmin_client.get_activity(aid) or {})["rpe_10"]
                 except Exception:
