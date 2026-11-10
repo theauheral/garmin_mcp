@@ -804,6 +804,93 @@ def _ceiling_share(samples, ceiling):
     }
 
 
+# Aerobic decoupling (Pa:HR, Friel): how far efficiency (speed per heartbeat)
+# falls from the first half of a steady effort to the second. Under 5% is the
+# usual mark of a durable aerobic engine; over 8% means the back half slipped.
+_DECOUPLING_MIN_USABLE_S = 20 * 60    # shorter than this the halves are noise
+_DECOUPLING_WARMUP_S = 10 * 60        # skipped only when the run is long enough to afford it
+_DECOUPLING_WARMUP_MIN_TOTAL_S = 50 * 60
+_DECOUPLING_MIN_SPEED = 0.5           # m/s: standing still is not running
+_DECOUPLING_STEADY_CV = 0.20          # pace spread above this is intervals/hills, not a steady effort
+
+
+def _aerobic_decoupling(rows):
+    """Pa:HR decoupling for one activity's stream rows, or None when it can't
+    be computed (no speed column, too short, nothing moving).
+
+    Splits the moving time in half by timer time and compares efficiency
+    (speed / HR, time-weighted) between the halves. `steady` is False when the
+    pace varied too much for the number to mean anything (intervals, hills) —
+    the figure is still returned, so the caller sees both and can say why it
+    is not a durability read.
+    """
+    pts = [(r["t"], r["hr"], r["speed"]) for r in rows or []
+           if r.get("speed") is not None and r["speed"] >= _DECOUPLING_MIN_SPEED]
+    if len(pts) < 4:
+        return None
+    cap = _gap_cap([(t, hr) for t, hr, _ in pts])
+    segs = []   # (start_t, seconds, hr, speed) — each sample weighted by the gap to the next
+    for (t0, hr, sp), (t1, _, _) in zip(pts, pts[1:]):
+        dt = t1 - t0
+        if 0 < dt <= cap:
+            segs.append((t0, dt, hr, sp))
+    if not segs:
+        return None
+    total_span = pts[-1][0] - pts[0][0]
+    skipped = _DECOUPLING_WARMUP_S if total_span >= _DECOUPLING_WARMUP_MIN_TOTAL_S else 0
+    start = pts[0][0] + skipped
+    segs = [s for s in segs if s[0] >= start]
+    usable = sum(s[1] for s in segs)
+    if usable < _DECOUPLING_MIN_USABLE_S:
+        return None
+    # Halve by moving time, so a long stop doesn't tilt where the middle falls.
+    half, acc, split = usable / 2, 0.0, len(segs)
+    for i, s in enumerate(segs):
+        acc += s[1]
+        if acc >= half:
+            split = i + 1
+            break
+    first, second = segs[:split], segs[split:]
+    if not first or not second:
+        return None
+
+    def _half(part):
+        secs = sum(s[1] for s in part)
+        hr = sum(s[2] * s[1] for s in part) / secs
+        speed = sum(s[3] * s[1] for s in part) / secs
+        return {
+            "avg_hr": _round(hr),
+            "pace_min_per_km": _round(1000 / speed / 60, 2),
+            "efficiency": speed / hr,
+        }
+
+    a, b = _half(first), _half(second)
+    pct = (a["efficiency"] - b["efficiency"]) / a["efficiency"] * 100
+    speeds = [s[3] for s in segs]
+    mean = sum(speeds) / len(speeds)
+    cv = (sum((v - mean) ** 2 for v in speeds) / len(speeds)) ** 0.5 / mean
+    steady = cv <= _DECOUPLING_STEADY_CV
+    if not steady:
+        read = "not a steady effort — pace varied too much for decoupling to mean anything"
+    elif pct < 5:
+        read = "under 5%: strong aerobic durability, the engine held"
+    elif pct <= 8:
+        read = "5-8%: moderate fade — a little hot or durability still building"
+    else:
+        read = "over 8%: too hard, or heat/fuel/fitness let the back half slip"
+    for h in (a, b):
+        h.pop("efficiency")
+    return {
+        "decoupling_pct": _round(pct),
+        "first_half": a,
+        "second_half": b,
+        "steady": steady,
+        "read": read,
+        "warmup_skipped_min": _round(skipped / 60) if skipped else 0,
+        "usable_min": _round(usable / 60),
+    }
+
+
 def _threshold_test(rows, effort_min=30, tail_min=20, garmin_lthr=None):
     """Read a 30-minute threshold field test out of one activity's stream.
 
@@ -1593,6 +1680,14 @@ def register_tools(app):
         reproduces the stored share the arithmetic is trustworthy.
         Activities with no HR stream say so in `not_recomputable`.
 
+        `aerobic_decoupling` (runs only) is Pa:HR: efficiency (speed per
+        heartbeat) of the second half against the first, warm-up skipped on
+        runs of 50+ minutes. Under 5% = durable aerobic engine, 5-8% = a
+        moderate fade, over 8% = too hard or the back half slipped. Only a
+        read on a steady effort: when the pace varied too much (intervals,
+        hills) `steady` is false and the figure is not a durability read.
+        Absent for runs under ~20 usable minutes or with no speed stream.
+
         Args:
             date: YYYY-MM-DD to analyse that day's longest activity (optional)
             activity_id: explicit Garmin activity id (optional; overrides date)
@@ -1659,6 +1754,9 @@ def register_tools(app):
                 result["hr_zones"] = stored_zones
             else:
                 result["hr_zones"] = {"recomputed": recomputed}
+
+            if rows and "running" in (result["session"].get("type") or ""):
+                result["aerobic_decoupling"] = _aerobic_decoupling(rows)
 
             if threshold_test:
                 garmin_lthr = model and (model.get("lthr_configured") or model.get("lthr"))
@@ -1788,6 +1886,12 @@ def register_tools(app):
         and the easy/grey/hard grading uses it (`execution_basis` says so).
         That grading does not depend on Garmin's zone model at all.
 
+        Each steady run also gets `decoupling_pct` (Pa:HR: second-half
+        efficiency against the first; under 5% = durable aerobic engine) and
+        the batch gets `aerobic_decoupling` (average, runs under 5%) — the
+        cleanest "is the base rebuilding" signal across a block. Runs with
+        varied pace or no speed stream are left out rather than scored.
+
         Zone easy-share is recomputed from each session's raw HR stream
         against the CURRENT zone model for the sport by default, because
         Garmin freezes zone times into an activity at upload and a stored
@@ -1853,6 +1957,13 @@ def register_tools(app):
                 samples, reason = (None, None)
                 if model or easy_ceiling_bpm:
                     samples, reason = _hr_stream(aid, _HR_STREAM_SAMPLES_TREND)
+                    if samples is not None:
+                        # Same cached rows as _hr_stream: no extra API call. Only a
+                        # steady effort gets a figure — intervals and hills would
+                        # drag the trend with a number that means nothing.
+                        dec = _aerobic_decoupling(_activity_stream(aid, _HR_STREAM_SAMPLES_TREND)[0])
+                        if dec and dec["steady"]:
+                            row["decoupling_pct"] = dec["decoupling_pct"]
                 # The graded zone share: recomputed when we can, stored
                 # otherwise, but never a mix — one basis is the point.
                 if model:
@@ -1893,6 +2004,13 @@ def register_tools(app):
             graded = [r for r in runs if r.get(share_key) is not None]
             avg_easy = round(fmean(r[share_key] for r in graded)) if graded else None
             dists = [r["km"] for r in runs if r.get("km")]
+            decs = [r["decoupling_pct"] for r in runs if r.get("decoupling_pct") is not None]
+            decoupling = _drop_none({
+                "avg_pct": round(fmean(decs), 1) if decs else None,
+                "runs_under_5pct": f"{sum(1 for d in decs if d < 5)} of {len(decs)}" if decs else None,
+                "basis": "Pa:HR on steady runs of ~20+ usable minutes; under 5% = durable aerobic engine"
+                         if decs else None,
+            }) or None
             ceiling = None
             if easy_ceiling_bpm:
                 under = [r["under_ceiling_pct"] for r in runs if r.get("under_ceiling_pct") is not None]
@@ -1915,6 +2033,7 @@ def register_tools(app):
                     if easy_ceiling_bpm else "zone easy-share (Z1-2)"
                 ),
                 "ceiling": ceiling,
+                "aerobic_decoupling": decoupling,
                 "avg_easy_share_pct": avg_easy,
                 "easy_share_basis": (
                     "recomputed from raw HR against the current zone model"

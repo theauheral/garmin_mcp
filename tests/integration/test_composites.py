@@ -766,6 +766,73 @@ async def test_session_analysis_says_when_zones_cannot_be_recomputed(
     assert zones["easy_share_pct"] == 0            # stored value still reported
 
 
+def hr_speed_stream_payload(seconds=2400, hr_end=154, speed=3.0):
+    """Steady-pace stream whose HR creeps 140 -> hr_end: a drifting aerobic effort."""
+    return {
+        "metricDescriptors": [
+            {"metricsIndex": 0, "key": "directHeartRate"},
+            {"metricsIndex": 1, "key": "sumDuration"},
+            {"metricsIndex": 2, "key": "directSpeed"},
+        ],
+        "activityDetailMetrics": [
+            {"metrics": [140 + (hr_end - 140) * t / seconds, t, speed]}
+            for t in range(0, seconds + 1, 10)
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_reports_aerobic_decoupling_for_a_run(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_speed_stream_payload()
+
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
+    dec = json.loads(result[0][0].text)["aerobic_decoupling"]
+
+    assert dec["steady"] is True
+    assert 4.5 < dec["decoupling_pct"] < 6.5        # HR drifts ~7% at a constant pace
+    assert dec["second_half"]["avg_hr"] > dec["first_half"]["avg_hr"]
+    assert dec["first_half"]["pace_min_per_km"] == dec["second_half"]["pace_min_per_km"]
+
+
+@pytest.mark.asyncio
+async def test_session_analysis_omits_decoupling_without_a_speed_stream(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.return_value = hr_stream_payload(145, seconds=2400)
+
+    result = await app_with_composites.call_tool("get_session_analysis", {"date": "2026-07-01"})
+
+    assert "aerobic_decoupling" not in json.loads(result[0][0].text)
+
+
+@pytest.mark.asyncio
+async def test_execution_trend_carries_decoupling_per_run_and_overall(
+    app_with_composites, mock_garmin_client
+):
+    mock_garmin_client.get_activities.return_value = [
+        {"activityId": 1, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-07-03 19:25", "distance": 7200, "averageHR": 150},
+        {"activityId": 2, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-07-01 14:31", "distance": 7200, "averageHR": 150},
+    ]
+    mock_garmin_client.get_activity_hr_in_timezones.return_value = FROZEN_ZONES
+    mock_garmin_client.connectapi.return_value = LIVE_ZONE_CONFIG
+    mock_garmin_client.get_activity_details.side_effect = lambda aid, **kw: (
+        hr_speed_stream_payload(hr_end=141) if aid == 1 else hr_speed_stream_payload(hr_end=175)
+    )
+
+    result = await app_with_composites.call_tool("get_execution_trend", {"count": 2})
+    data = json.loads(result[0][0].text)
+
+    assert data["sessions"][0]["decoupling_pct"] < 1          # held
+    assert data["sessions"][1]["decoupling_pct"] > 8          # faded
+    assert data["aerobic_decoupling"]["runs_under_5pct"] == "1 of 2"
+
+
 @pytest.mark.asyncio
 async def test_session_analysis_reports_an_unreadable_zone_configuration(
     app_with_composites, mock_garmin_client
